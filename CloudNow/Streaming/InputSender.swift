@@ -717,6 +717,7 @@ final nonisolated class InputSender: @unchecked Sendable {
     private var steamOverlayGestureEnabled = true
     private var isPaused = false
     private var isRunning = false
+    private var isDiscoveringControllers = false
     private var sonyGamepadEnabled = false
     private var sonySlots = Set<Int>()
     private var sonyAttachTokens: [Int: UUID] = [:]
@@ -787,8 +788,8 @@ final nonisolated class InputSender: @unchecked Sendable {
             timer.setEventHandler { [weak self] in self?.tick() }
             sampler = timer
             timer.resume()
+            updateWirelessControllerDiscovery()
         }
-        GCController.startWirelessControllerDiscovery()
     }
 
     func stop() {
@@ -821,6 +822,23 @@ final nonisolated class InputSender: @unchecked Sendable {
             gamepadBitmap = 0
             lastSnapshots.removeAll()
             lastSnapshotSend.removeAll()
+            updateWirelessControllerDiscovery()
+        }
+    }
+
+    /// Scans for wireless controllers only while no extended controller is attached.
+    /// A continuous Bluetooth scan can disturb the link of a controller that is already
+    /// connected; paired controllers reconnect through the system without discovery.
+    private func updateWirelessControllerDiscovery() {
+        let shouldDiscover = isRunning && extendedControllers.isEmpty
+        guard shouldDiscover != isDiscoveringControllers else { return }
+        isDiscoveringControllers = shouldDiscover
+        DispatchQueue.main.async {
+            if shouldDiscover {
+                GCController.startWirelessControllerDiscovery()
+            } else {
+                GCController.stopWirelessControllerDiscovery()
+            }
         }
     }
 
@@ -1095,7 +1113,8 @@ final nonisolated class InputSender: @unchecked Sendable {
         guard !isPaused,
               let slot = controllerSlots[ObjectIdentifier(controller)] else { return }
 
-        let buttons = mapGCControllerToXInput(controller, deadzone: deadzone).buttons
+        let state = mapGCControllerToXInput(controller, deadzone: deadzone)
+        let buttons = state.buttons
         let previousButtons = lastButtons[slot] ?? buttons
         let changed = previousButtons ^ buttons
         lastButtons[slot] = buttons
@@ -1110,7 +1129,18 @@ final nonisolated class InputSender: @unchecked Sendable {
             }
         }
 
-        guard changed & ~overlayButtonMask != 0 else { return }
+        // Stick and trigger movement is forwarded as soon as GameController reports it
+        // instead of waiting for the next sampler tick, which adds up to one sample
+        // interval of input latency. Unchanged snapshots are still dropped downstream.
+        let analogChanged = lastSnapshots[slot].map {
+            $0.leftTrigger != state.leftTrigger
+                || $0.rightTrigger != state.rightTrigger
+                || $0.leftStickX != state.lx
+                || $0.leftStickY != state.ly
+                || $0.rightStickX != state.rx
+                || $0.rightStickY != state.ry
+        } ?? false
+        guard changed & ~overlayButtonMask != 0 || analogChanged else { return }
         sendGamepadState(
             for: controller,
             sampleOverlay: false,
@@ -1964,6 +1994,7 @@ final nonisolated class InputSender: @unchecked Sendable {
             guard !extendedControllers.contains(where: { $0 === controller }),
                   let slot = firstFreeSlot else { return }
             extendedControllers.append(controller)
+            updateWirelessControllerDiscovery()
             controllerSlots[ObjectIdentifier(controller)] = slot
             controller.playerIndex = playerIndex(for: slot)
             if rumbleEnabled, let haptic = ControllerHaptics(controller: controller) {
@@ -2032,6 +2063,7 @@ final nonisolated class InputSender: @unchecked Sendable {
                 advertiseHaptics(false)
             }
             extendedControllers.removeAll { $0 === controller }
+            updateWirelessControllerDiscovery()
             gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
             lastButtons[slot] = nil
             lastSnapshots[slot] = nil
