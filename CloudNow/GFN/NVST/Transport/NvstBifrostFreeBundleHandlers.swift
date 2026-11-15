@@ -26,15 +26,16 @@ extension NvstBifrostFreeTransport {
             }
         }
         bundle.onControlChannelOpen = { [weak self] in
+            guard let self else { return }
             // The seat starts its 10 s client-timeout the moment the SCTP association is up, so the
             // first pingBackAck gets its own task rather than queueing behind the state announce.
             Task {
-                await self?.withCurrentBundleGeneration(generation) { transport in
+                await self.withCurrentBundleGeneration(generation) { transport in
                     transport.startControlKeepAlive()
                 }
             }
             Task {
-                await self?.withCurrentBundleGeneration(generation) { transport in
+                await self.withCurrentBundleGeneration(generation) { transport in
                     transport.announceClientState()
                     // The seat's protocol version normally arrives after this channel opens, but
                     // nothing orders the two callbacks; whichever lands second runs the chain.

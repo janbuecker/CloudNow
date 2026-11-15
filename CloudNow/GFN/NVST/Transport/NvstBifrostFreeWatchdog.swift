@@ -177,3 +177,26 @@ nonisolated struct NvstPerformanceSampler: Equatable, Sendable {
         current >= previous ? current - previous : 0
     }
 }
+
+/// Resumes a continuation exactly once, with whichever answer arrives first. Used to bound waits
+/// on callbacks that are not guaranteed to fire: a statistics request against a closing peer
+/// connection, a TEARDOWN on a control socket that has gone quiet.
+final nonisolated class NvstOneShot<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Never>?
+
+    init(_ continuation: CheckedContinuation<Value, Never>) {
+        self.continuation = continuation
+    }
+
+    /// Returns true when this call was the one that resumed the continuation.
+    @discardableResult
+    func resume(_ value: Value) -> Bool {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: value)
+        return pending != nil
+    }
+}

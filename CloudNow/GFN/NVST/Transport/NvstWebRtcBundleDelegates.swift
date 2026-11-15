@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 @preconcurrency import LiveKitWebRTC
 
@@ -341,15 +342,29 @@ nonisolated extension NvstWebRtcBundle {
         }
     }
 
+    /// Longest `audioReception()` waits for libwebrtc to answer a statistics request.
+    static let statisticsTimeoutSeconds = 1.0
+
     func audioReception() async -> AudioReception? {
-        // `statistics` answers through a callback, and a continuation that is never resumed hangs
-        // its caller for good. `close()` nils the connection and latches `isClosed`, so a closed
-        // bundle is never asked.
+        // `close()` nils the connection and latches `isClosed`, so a closed bundle is never asked.
         let connection: LKRTCPeerConnection? = lock.withLock { isClosed ? nil : peerConnection }
         guard let connection else { return nil }
-        let report = await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
-            connection.statistics { continuation.resume(returning: $0) }
+        // `statistics` answers through a callback, and a continuation that is never resumed hangs
+        // its caller for good — a connection closing underneath the request must not do that, so
+        // the wait is bounded.
+        return await withCheckedContinuation { (continuation: CheckedContinuation<AudioReception?, Never>) in
+            let once = NvstOneShot(continuation)
+            connection.statistics { report in
+                once.resume(Self.audioReception(in: report))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.statisticsTimeoutSeconds) {
+                once.resume(nil)
+            }
         }
+    }
+
+    /// The totals of every `inbound-rtp` audio entry in `report`, or nil when there is none.
+    static func audioReception(in report: LKRTCStatisticsReport) -> AudioReception? {
         var reception = AudioReception()
         var sawAudio = false
         for statistics in report.statistics.values

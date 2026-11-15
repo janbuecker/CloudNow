@@ -2592,6 +2592,8 @@ private enum GFNNVSTConnectOutcome {
 private extension GFNStreamController {
     /// The bare gamepad report layout the NVST transport rewrites onto its input channel.
     static let nvstInputProtocolVersion = 2
+    /// NVST result code the seat sends when it pauses, rather than ends, the session.
+    static let nvstSessionPauseCode: UInt32 = 0x8003_000E
 
     func connectNVST(
         session: SessionInfo,
@@ -2608,6 +2610,8 @@ private extension GFNStreamController {
         ) else {
             return .unavailable("session advertises no NVST endpoint")
         }
+        // NVST carries stereo only; a previous surround session must not leave a wider layout.
+        GFNAudioDevice.shared.requestedOutputChannels = 2
         _ = configureAudioSession(microphoneRequested: false)
         let relay = nvstFrameRelay
         let transport = GFNNVSTTransport(
@@ -2665,10 +2669,15 @@ private extension GFNStreamController {
             videoColorLog.info("NVST seat HDR mode enabled=\(enabled, privacy: .public)")
         case let .sessionTerminated(code, name):
             gfnLog.info("NVST seat ended the session code=\(code, privacy: .public) name=\(name ?? "unknown", privacy: .public)")
-            serverStopped = true
             stopStatsTimer()
             tearDownNVST(resetPicture: false)
-            state = .sessionEnded
+            if code == Self.nvstSessionPauseCode, wasStreaming {
+                // A seat-side pause keeps the allocation; reclaim it like a dropped connection.
+                attemptReconnect()
+            } else {
+                serverStopped = true
+                state = .sessionEnded
+            }
         case let .failed(message):
             gfnLog.error("NVST transport failed: \(message, privacy: .public)")
             stopStatsTimer()

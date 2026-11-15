@@ -164,14 +164,22 @@ nonisolated extension NvstWebRtcBundle {
         return (fields[4], port)
     }
 
-    /// The candidate on the routed interface, falling back to the first gathered one.
+    /// The candidate on the routed interface. Without one, the first IPv4 candidate — the seat's
+    /// address from SETUP is IPv4, and ANNOUNCE names exactly one local address — and only then
+    /// whatever was gathered first.
     static func preferredHost(among hosts: [(address: String, port: UInt16)],
                               matching preferredAddress: String?) -> (address: String, port: UInt16)?
     {
         if let preferredAddress, let match = hosts.first(where: { $0.address == preferredAddress }) {
             return match
         }
-        return hosts.first
+        return hosts.first(where: { isIPv4Address($0.address) }) ?? hosts.first
+    }
+
+    /// Dotted-quad check, enough to tell an IPv4 host candidate from an IPv6 or mDNS one.
+    static func isIPv4Address(_ address: String) -> Bool {
+        let parts = address.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { UInt8($0) != nil }
     }
 
     // MARK: - Async bridges

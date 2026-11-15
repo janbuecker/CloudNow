@@ -12,6 +12,8 @@ import Foundation
 final nonisolated class GFNNVSTTransport: @unchecked Sendable {
     /// How long `connect()` waits for the first decoded frame once negotiation has finished.
     static let defaultFirstFrameTimeout: Duration = .seconds(15)
+    /// How long `connect()` lets the RTSPS negotiation and bundle bring-up run before giving up.
+    static let defaultNegotiationTimeout: Duration = .seconds(20)
     /// How often the first-frame wait looks.
     static let firstFramePollInterval: Duration = .milliseconds(20)
 
@@ -27,6 +29,8 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
         /// A terminal report that arrived before `connect()` returned; it fails the connect
         /// instead of being delivered as an event.
         var terminalDuringConnect: NativeNVSTTransportTermination?
+        /// Releases a `connect()` that is still waiting on the negotiation.
+        var abandonNegotiation: (@Sendable () -> Void)?
     }
 
     /// Events after a successful `connect()`. Finishes on `disconnect()`.
@@ -38,6 +42,7 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
     private let request: GFNNVSTConnectRequest
     private let transport: NvstBifrostFreeTransport
     private let log: @Sendable (String) -> Void
+    private let negotiationTimeout: Duration
     private let firstFrameTimeout: Duration
     private let eventContinuation: AsyncStream<GFNNVSTEvent>.Continuation
     private let lock = NSLock()
@@ -53,6 +58,7 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
                   peerConnectionFactory: peerConnectionFactory,
                   frameSink: frameSink,
                   log: log,
+                  negotiationTimeout: Self.defaultNegotiationTimeout,
                   firstFrameTimeout: Self.defaultFirstFrameTimeout)
     }
 
@@ -60,10 +66,12 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
          peerConnectionFactory: LKRTCPeerConnectionFactory,
          frameSink: @escaping GFNNVSTFrameSink,
          log: @escaping @Sendable (String) -> Void,
+         negotiationTimeout: Duration,
          firstFrameTimeout: Duration)
     {
         self.request = request
         self.log = log
+        self.negotiationTimeout = negotiationTimeout
         self.firstFrameTimeout = firstFrameTimeout
         let stream = AsyncStream<GFNNVSTEvent>.makeStream()
         events = stream.stream
@@ -77,6 +85,12 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
         )
     }
 
+    deinit {
+        // A transport dropped without `disconnect()` still has timers and sockets of its own.
+        let transport = transport
+        Task { await transport.disconnect() }
+    }
+
     /// The decoder stamps each frame with its RTP timestamp on the 90 kHz clock; this is that
     /// timestamp back as the 32-bit wire value.
     static func rtpTimestamp(from presentationTime: CMTime) -> UInt32 {
@@ -84,9 +98,11 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
     }
 
     /// Negotiates RTSPS, brings up the bundle, starts video and returns once the FIRST FRAME has
-    /// been decoded. Throws `.firstFrameTimeout` after a bounded wait (15 s by default), and tears
-    /// everything down before throwing so the caller can fall back to WebRTC. Honors task
-    /// cancellation (`.cancelled`).
+    /// been decoded. Throws `.firstFrameTimeout` when no frame is decoded within a bounded wait
+    /// (15 s by default) of the negotiation finishing, and `.negotiationFailed` when the
+    /// negotiation itself does not finish in time (20 s by default). Everything is torn down
+    /// before it throws so the caller can fall back to WebRTC. Honors task cancellation
+    /// (`.cancelled`).
     func connect() async throws {
         let canStart: Bool = lock.withLock {
             guard state.phase == .idle else { return false }
@@ -114,14 +130,7 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
         await installHandlers()
         startTerminalForwarding()
 
-        let transport = transport
-        try await withTaskCancellationHandler {
-            try await transport.connect(request: self.request)
-        } onCancel: {
-            // The negotiation does not watch for cancellation itself; tearing the transport down
-            // is what makes it stop at its next step.
-            Task { await transport.disconnect() }
-        }
+        try await negotiate()
         try await waitForFirstFrame()
 
         let becameConnected: Bool = lock.withLock {
@@ -134,6 +143,48 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
         }
         await transport.armWatchdog()
         log("NVST connected: first frame decoded")
+    }
+
+    /// Runs the transport's negotiation, giving up on it as soon as this transport is
+    /// disconnected, the calling task is cancelled, or `negotiationTimeout` has passed.
+    ///
+    /// The negotiation runs in a task of its own, so cancelling the caller never cancels an RTSP
+    /// request in flight; it is stopped by tearing the transport down instead, which it notices
+    /// at its next step and cleans up after on its own.
+    private func negotiate() async throws {
+        let transport = transport
+        let request = request
+        let timeout = negotiationTimeout
+        let outcome: Result<Void, any Error> = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, any Error>, Never>) in
+                let once = NvstOneShot(continuation)
+                let isStillConnecting: Bool = lock.withLock {
+                    guard state.phase == .connecting else { return false }
+                    state.abandonNegotiation = { once.resume(.failure(CancellationError())) }
+                    return true
+                }
+                guard isStillConnecting else {
+                    once.resume(.failure(CancellationError()))
+                    return
+                }
+                Task {
+                    do {
+                        try await transport.connect(request: request)
+                        once.resume(.success(()))
+                    } catch {
+                        once.resume(.failure(error))
+                    }
+                }
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    once.resume(.failure(GFNNVSTError.negotiationFailed("The NVST negotiation did not finish in time.")))
+                }
+            }
+        } onCancel: {
+            Task { await self.disconnect() }
+        }
+        lock.withLock { state.abandonNegotiation = nil }
+        try outcome.get()
     }
 
     /// Why the connect cannot complete, when something ended it from outside the happy path.
@@ -207,13 +258,15 @@ final nonisolated class GFNNVSTTransport: @unchecked Sendable {
     /// Idempotent. Stops timers, closes sockets, the RTSPS connection and the peer connection,
     /// and finishes `events`. Returns once the teardown has completed.
     func disconnect() async {
-        let forwarding: Task<Void, Never>? = lock.withLock {
+        let (forwarding, abandonNegotiation): (Task<Void, Never>?, (@Sendable () -> Void)?) = lock.withLock {
             state.phase = .closed
-            let task = terminalForwardingTask
+            let pending = (terminalForwardingTask, state.abandonNegotiation)
             terminalForwardingTask = nil
-            return task
+            state.abandonNegotiation = nil
+            return pending
         }
         await transport.disconnect()
+        abandonNegotiation?()
         forwarding?.cancel()
         eventContinuation.finish()
     }

@@ -226,7 +226,7 @@ actor NvstBifrostFreeTransport {
         guard phase == .connecting, !Task.isCancelled else {
             // A disconnect ran while the negotiation was suspended. It could not release a
             // session that did not exist yet, so this does.
-            await negotiated.release("superseded")
+            await Self.release(negotiated, reason: "superseded")
             await teardown(reason: "superseded")
             throw CancellationError()
         }
@@ -443,8 +443,28 @@ actor NvstBifrostFreeTransport {
         self.reserver = nil
         terminationContinuation.finish()
         if let session {
-            await session.release(reason)
+            await Self.release(session, reason: reason)
         }
         reserver?.release()
+    }
+
+    /// How long teardown waits for the RTSPS TEARDOWN to be answered before moving on.
+    static let controlReleaseGrace: Duration = .seconds(2)
+
+    /// Stops the keepalive, sends TEARDOWN and closes the control connection, waiting at most
+    /// `controlReleaseGrace`. A seat that has gone quiet would otherwise hold the caller for the
+    /// whole request timeout; the release itself still runs to completion in the background.
+    private static func release(_ session: NvstRtspSession, reason: String) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let once = NvstOneShot(continuation)
+            Task {
+                await session.release(reason)
+                once.resume(())
+            }
+            Task {
+                try? await Task.sleep(for: controlReleaseGrace)
+                once.resume(())
+            }
+        }
     }
 }
