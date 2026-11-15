@@ -49,7 +49,12 @@ final nonisolated class CloudVideoDecoderAV1: NSObject, LKRTCVideoDecoder, @unch
         do {
             if let next = try AV1StreamConfiguration.parse(from: data), next != configuration {
                 guard let format = Self.makeFormatDescription(configuration: next) else { return -1 }
-                destroySession()
+                // Keep the session when VideoToolbox can absorb the new sequence header.
+                if let session, VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: format) {
+                    CloudVideoDecoderCounters.shared.recordSessionReuse()
+                } else {
+                    destroySession()
+                }
                 configuration = next
                 videoFormat = format
             }
@@ -85,6 +90,7 @@ final nonisolated class CloudVideoDecoderAV1: NSObject, LKRTCVideoDecoder, @unch
             self?.callback?(frame)
         }
         // Synchronous decode keeps output associated with this WebRTC frame's timestamp.
+        let decodeStart = DispatchTime.now().uptimeNanoseconds
         var status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample, flags: [], infoFlagsOut: nil, outputHandler: handler
         )
@@ -99,6 +105,7 @@ final nonisolated class CloudVideoDecoderAV1: NSObject, LKRTCVideoDecoder, @unch
             av1Log.error("Decode failed: \(status)")
             return -1
         }
+        CloudVideoDecoderCounters.shared.recordDecode(nanoseconds: DispatchTime.now().uptimeNanoseconds - decodeStart)
         return 0
     }
 
@@ -122,6 +129,9 @@ final nonisolated class CloudVideoDecoderAV1: NSObject, LKRTCVideoDecoder, @unch
             return false
         }
         VTSessionSetProperty(newSession, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        CloudVideoDecoderCounters.shared.recordSessionBuild(
+            isHardwareAccelerated: cloudVideoDecoderUsesHardware(newSession)
+        )
         session = newSession
         return true
     }

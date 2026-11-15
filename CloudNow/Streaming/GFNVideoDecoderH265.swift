@@ -227,7 +227,14 @@ final nonisolated class CloudVideoDecoderH265: NSObject, LKRTCVideoDecoder, @unc
                 let formatChanged = videoFormat.map { !CMFormatDescriptionEqual($0, otherFormatDescription: format) } ?? true
                 if formatChanged {
                     videoFormat = format
-                    destroySession()
+                    // GFN flips benign parameter-set bits (for example the HEVC tier flag)
+                    // mid-stream. Rebuilding the session for each one stalls the picture, so
+                    // keep the session whenever VideoToolbox can take the new description.
+                    if let session, VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: format) {
+                        CloudVideoDecoderCounters.shared.recordSessionReuse()
+                    } else {
+                        destroySession()
+                    }
                 }
             }
         }
@@ -260,6 +267,7 @@ final nonisolated class CloudVideoDecoderH265: NSObject, LKRTCVideoDecoder, @unc
         }
         // Synchronous decode: GFN streams have no B-frame reordering (zero-latency encode),
         // so decode order is display order and no reorder queue is needed.
+        let decodeStart = DispatchTime.now().uptimeNanoseconds
         var status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sampleBuffer, flags: [], infoFlagsOut: nil, outputHandler: handler)
         if status == kVTInvalidSessionErr {
             // Session dies when the app is backgrounded — recreate and retry once.
@@ -271,6 +279,7 @@ final nonisolated class CloudVideoDecoderH265: NSObject, LKRTCVideoDecoder, @unc
             h265Log.error("decode failed: \(status)")
             return -1
         }
+        CloudVideoDecoderCounters.shared.recordDecode(nanoseconds: DispatchTime.now().uptimeNanoseconds - decodeStart)
         return 0
     }
 
@@ -297,6 +306,9 @@ final nonisolated class CloudVideoDecoderH265: NSObject, LKRTCVideoDecoder, @unc
             return false
         }
         VTSessionSetProperty(newSession, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        CloudVideoDecoderCounters.shared.recordSessionBuild(
+            isHardwareAccelerated: cloudVideoDecoderUsesHardware(newSession)
+        )
         session = newSession
         return true
     }
@@ -372,6 +384,24 @@ final nonisolated class CloudVideoDecoderH265: NSObject, LKRTCVideoDecoder, @unc
         guard status == noErr else { return nil }
         return sampleBuffer
     }
+}
+
+/// Reads back whether VideoToolbox backed the session with the hardware decoder.
+///
+/// WebRTC's `powerEfficientDecoder` statistic is reported for every injected decoder, so it
+/// cannot confirm hardware decode; this property can.
+nonisolated func cloudVideoDecoderUsesHardware(_ session: VTDecompressionSession) -> Bool? {
+    var value: CFTypeRef?
+    let status = withUnsafeMutablePointer(to: &value) { pointer in
+        VTSessionCopyProperty(
+            session,
+            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+            allocator: kCFAllocatorDefault,
+            valueOut: pointer
+        )
+    }
+    guard status == noErr, let value, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+    return (value as? Bool)
 }
 
 /// Source compatibility for existing native-provider references.
