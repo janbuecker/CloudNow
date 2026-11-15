@@ -54,6 +54,7 @@ preferences, so a newly changed default does not overwrite a previous choice.
 | Maximum bitrate | 100 Mbps | No client cap |
 | L4S | On | Not exposed |
 | Adaptive frame pacing | Off | Off |
+| Experimental NVST transport | Off | Not available |
 | Game language | Automatic | Automatic |
 | Microphone | Off | Off |
 | Controller rumble | On | On |
@@ -74,6 +75,7 @@ preferences, so a newly changed default does not overwrite a previous choice.
 | Maximum bitrate | 15 to 100 Mbps | No client bitrate cap |
 | L4S | Toggle | Not exposed |
 | Adaptive frame pacing | Toggle, off by default | Toggle, off by default |
+| Experimental NVST transport | Toggle, off by default | Not available |
 | Server location | NVIDIA automatic, region, or dedicated server | Service selected |
 | Keyboard layout | Selectable | Not exposed |
 | Game language | Selectable | Selectable |
@@ -103,6 +105,35 @@ Check motion during camera movement, controller response, and audio/video
 synchronization in each provider. A smoothness improvement is not guaranteed,
 and simulator tests alone cannot establish the benefit on a real display.
 
+## Experimental NVST transport
+
+Experimental NVST Transport is off by default and applies only to GeForce NOW.
+It has not been validated on Apple TV hardware; treat it as a preview.
+
+When it is on, a newly created session is allocated without the WebRTC streamer
+tag and with secure RTSP advertised. CloudNow then negotiates the stream over
+RTSPS, receives video as raw SRTP on its own UDP socket, recovers loss with
+forward error correction and retransmission requests, and decodes with
+VideoToolbox. A WebRTC peer connection still carries the control, input, and
+feedback data channels and stereo game audio; it carries no video.
+
+The intent is lower CPU and memory use by bypassing the WebRTC video jitter
+buffer and frame path. That saving is expected, not measured.
+
+Current limits of the NVST path:
+
+- Video, stereo game audio, controllers, the Siri Remote in controller mode, and
+  rumble are carried. Microphone, surround audio, keyboard, mouse, pointer mode,
+  and controller-triggered text entry are not; use WebRTC for those.
+- Continued and resumed sessions stay on WebRTC. Only a session created while
+  the toggle is on attempts NVST.
+- If NVST cannot negotiate or no frame arrives in time, CloudNow claims the
+  WebRTC transport for the same allocation and connects as before. If an NVST
+  stream fails later, reconnection also uses WebRTC. Both fallbacks depend on
+  the service accepting a WebRTC resume of a native allocation, which is
+  unverified.
+- The statistics HUD shows which transport is active in its Transport row.
+
 ## GeForce NOW settings
 
 ### Stream quality
@@ -121,6 +152,7 @@ and simulator tests alone cannot establish the benefit on a real display.
 | Max Bitrate | 100 Mbps | 15 to 100 Mbps in 5 Mbps steps | Sends a maximum bitrate preference. Network and service adaptation can remain below it. |
 | Low Latency Mode | On | Always shown | Requests L4S behavior. It is useful only with a compatible router and ISP. |
 | Adaptive Frame Pacing | Off | Always shown | Briefly holds decoded frames to smooth uneven arrival timing. Adds input latency. Applies to the next GFN session. See [Adaptive frame pacing](#adaptive-frame-pacing). |
+| Experimental NVST Transport | Off | Always shown | Requests a native allocation and receives video as raw SRTP decoded directly by VideoToolbox instead of through the WebRTC video pipeline. Applies to newly created GFN sessions. See [Experimental NVST transport](#experimental-nvst-transport). |
 
 #### Frame-rate eligibility
 
@@ -216,7 +248,7 @@ to the controller that started it, and restores Settings focus after cancellatio
 |---|---|---|
 | Save In-Game Settings | On | Premium tiers, including Ultimate and Performance or legacy Priority, can change the toggle. A known Free account keeps the disabled toggle visible with the current membership and required plans. An unknown tier can change the preference, but the service remains authoritative. |
 | Refresh Library | Action, no saved value | Shown only in builds with provider library synchronization enabled. It refreshes linked-library and catalog data. |
-| Statistics | Off | Changed from the in-stream pause menu. Compact and Standard are available. |
+| Statistics | Off | Changed from the in-stream pause menu. Compact and Standard are available. Standard also shows the active transport, session-total frame drops and packet loss, the app decoder's p99 decode time next to the mean, whether VideoToolbox reports hardware decoding (HW or SW), and, on NVST, packets recovered by forward error correction. |
 | Diagnostics | Off | Developer builds only. Enables additional local diagnostics. |
 | RTC Event Log | Off | Developer builds only and disabled unless Diagnostics is on. The bounded log applies to the next stream. tvOS does not expose a supported local export path. |
 

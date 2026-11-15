@@ -88,6 +88,8 @@ private nonisolated struct CloudMatchResponse: Decodable {
             let ip: AnyCodableString?
             let port: Int
             let resourcePath: String?
+            /// Tags the RTSPS control endpoint on native (NVST) allocations.
+            let appLevelProtocol: Int?
         }
 
         struct IceServerConfig: Decodable {
@@ -233,6 +235,23 @@ private nonisolated func buildSessionRequestBody(
         localCapabilities: input.localVideoCapabilities,
         accountAllowsHDR: input.accountAllowsHDR
     )
+    // The native NVST allocation differs from the WebRTC one in exactly two body fields: it
+    // omits the WebRTC streamer tag and advertises secure RTSP so the seat exposes its RTSPS
+    // control endpoint. Headers are shared with the WebRTC allocation.
+    let usesNVST = input.settings.experimentalNVSTTransport
+    var metaData: [[String: String]] = [
+        ["key": "SubSessionId", "value": subSessionId],
+        ["key": "wssignaling", "value": "1"],
+    ]
+    if !usesNVST {
+        metaData.append(["key": "GSStreamerType", "value": "WebRTC"])
+    }
+    metaData += [
+        ["key": "networkType", "value": "Unknown"],
+        ["key": "ClientImeSupport", "value": "0"],
+        ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
+        ["key": "surroundAudioInfo", "value": "\(audioChannels)"],
+    ]
 
     return [
         "sessionRequestData": [
@@ -265,15 +284,7 @@ private nonisolated func buildSessionRequestBody(
             // configures the rig's audio endpoint — leaving it at 2 makes games render
             // stereo, so the rear channels of a negotiated 5.1 stream stay silent.
             "audioMode": audioChannels,
-            "metaData": [
-                ["key": "SubSessionId", "value": subSessionId],
-                ["key": "wssignaling", "value": "1"],
-                ["key": "GSStreamerType", "value": "WebRTC"],
-                ["key": "networkType", "value": "Unknown"],
-                ["key": "ClientImeSupport", "value": "0"],
-                ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
-                ["key": "surroundAudioInfo", "value": "\(audioChannels)"],
-            ],
+            "metaData": metaData,
             "sdrHdrMode": cloudMatchSdrHdrMode(color),
             "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
             "surroundAudioInfo": cloudMatchSurroundAudioInfo(channels: audioChannels),
@@ -281,7 +292,7 @@ private nonisolated func buildSessionRequestBody(
             "clientTimezoneOffset": timezoneOffsetMilliseconds,
             "enhancedStreamMode": 1,
             "appLaunchMode": input.settings.appLaunchMode.cloudMatchValue,
-            "secureRTSPSupported": false,
+            "secureRTSPSupported": usesNVST,
             "partnerCustomData": "",
             "accountLinked": input.accountLinked,
             "enablePersistingInGameSettings": input.settings.persistInGameSettings,
@@ -942,7 +953,16 @@ actor CloudMatchClient {
             deviceId: deviceId,
             adState: adState,
             controlServerIp: normalizedControlServerIp(s.sessionControlInfo?.ip?.value),
-            acceptedSdrHdrMode: lastAcceptedSdrHdrMode
+            acceptedSdrHdrMode: lastAcceptedSdrHdrMode,
+            nvstEndpoints: connections.map {
+                GFNNVSTConnectionEndpoint(
+                    usage: $0.usage,
+                    ip: $0.ip?.value,
+                    port: $0.port,
+                    resourcePath: $0.resourcePath,
+                    appLevelProtocol: $0.appLevelProtocol
+                )
+            }
         )
     }
 

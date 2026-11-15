@@ -100,6 +100,37 @@ struct CloudMatchClientTests {
         #expect(session.iceServers.first?.urls == ["stun:stun.example.invalid:3478"])
     }
 
+    @Test("Session creation selects the WebRTC or NVST allocation and keeps every endpoint", arguments: [false, true])
+    func createSessionTransportSelection(usesNVST: Bool) async throws {
+        let fixture = try NetworkingFixture.data("cloudmatch-session.json")
+        let transport = RecordingHTTPTransport { request, _ in
+            // Both transports allocate with the native streamer header; only the body differs.
+            #expect(request.value(forHTTPHeaderField: "nv-client-streamer") == "NVIDIA-CLASSIC")
+            let root = try jsonObject(from: request)
+            let session = try #require(root["sessionRequestData"] as? [String: Any])
+            let metadata = try #require(session["metaData"] as? [[String: Any]])
+            let streamerTag = metadata.first { $0["key"] as? String == "GSStreamerType" }?["value"] as? String
+            #expect(session["secureRTSPSupported"] as? Bool == usesNVST)
+            #expect(streamerTag == (usesNVST ? nil : "WebRTC"))
+            #expect(session["clientPlatformName"] as? String == "windows")
+            #expect(metadata.first { $0["key"] as? String == "wssignaling" }?["value"] as? String == "1")
+            return StubbedHTTPResponse(data: fixture)
+        }
+        let client = CloudMatchClient(
+            transport: transport,
+            uuid: { UUID() },
+            deviceId: { "fixture-device" },
+            timezoneOffsetMilliseconds: { 0 }
+        )
+
+        let session = try await client.createSession(makeSessionRequest(experimentalNVSTTransport: usesNVST))
+
+        #expect(session.nvstEndpoints == [
+            GFNNVSTConnectionEndpoint(usage: 14, ip: "203.0.113.10", port: 443, resourcePath: "/nvst/", appLevelProtocol: nil),
+            GFNNVSTConnectionEndpoint(usage: 2, ip: "203.0.113.11", port: 49005, resourcePath: nil, appLevelProtocol: nil),
+        ])
+    }
+
     @Test(
         "Session chroma request respects selection and codec without changing color precision",
         arguments: [
@@ -901,9 +932,11 @@ struct CloudMatchClientTests {
         audioFormat: AudioFormatPreference = .stereo,
         codec: VideoCodec = .h265,
         colorPreference: ColorModePreference = .forceSDR8,
-        chromaFormat: ChromaFormat = .yuv444
+        chromaFormat: ChromaFormat = .yuv444,
+        experimentalNVSTTransport: Bool = false
     ) -> SessionCreateRequest {
         var settings = StreamSettings()
+        settings.experimentalNVSTTransport = experimentalNVSTTransport
         settings.resolution = "3840x2160"
         settings.fps = 120
         settings.maxBitrateKbps = 100_000

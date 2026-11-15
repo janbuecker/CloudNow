@@ -283,3 +283,6 @@ MIT. See [LICENSE](LICENSE).
   depths and region mapping.
 - [livekit/webrtc-xcframework](https://github.com/livekit/webrtc-xcframework)
   provides WebRTC for Apple platforms.
+- [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW-Mac) is the source of the
+  experimental NVST transport code. See
+  [third-party notices](Documentation/ThirdPartyNotices.md).

@@ -1014,29 +1014,31 @@ struct StreamView: View {
             }
             try requireCurrentSessionAttempt(generation)
 
-            if requiresWebRTCClaim {
-                // Keep the allocation's capabilities while claiming its WebRTC transport.
+            // Keep the allocation's capabilities while claiming its WebRTC transport.
+            let readySession = sessionInfo
+            let claimAppId = connectedAppId
+            let claimWebRTC: @MainActor () async throws -> SessionInfo = {
+                var claimed = readySession
                 var needsWebRTCClaim = true
                 while needsWebRTCClaim {
-                    let readySession = sessionInfo
-                    sessionInfo = try await cloudMatchClient.claimSession(
-                        sessionId: readySession.sessionId,
-                        serverIp: readySession.serverIp,
+                    claimed = try await cloudMatchClient.claimSession(
+                        sessionId: claimed.sessionId,
+                        serverIp: claimed.serverIp,
                         token: token,
-                        base: readySession.streamingBaseUrl,
-                        routingZoneUrl: readySession.zone,
-                        clientId: readySession.clientId,
-                        deviceId: readySession.deviceId,
-                        appId: connectedAppId,
+                        base: claimed.streamingBaseUrl,
+                        routingZoneUrl: claimed.zone,
+                        clientId: claimed.clientId,
+                        deviceId: claimed.deviceId,
+                        appId: claimAppId,
                         settings: settings,
                         accountAllowsHDR: viewModel.subscription?.allowsHDR
                     )
                     try requireCurrentSessionAttempt(generation)
-                    needsWebRTCClaim = sessionInfo.status == 1 || sessionInfo.isInQueue
-                    createdSession = sessionInfo
-                    sessionOrchestrator.adopt(sessionInfo, token: token)
-                    sessionInfo = try await sessionOrchestrator.waitUntilReady(
-                        initialSession: sessionInfo,
+                    needsWebRTCClaim = claimed.status == 1 || claimed.isInQueue
+                    createdSession = claimed
+                    sessionOrchestrator.adopt(claimed, token: token)
+                    claimed = try await sessionOrchestrator.waitUntilReady(
+                        initialSession: claimed,
                         token: token,
                         attempt: orchestrationAttempt,
                         setupTimeout: nil
@@ -1049,9 +1051,19 @@ struct StreamView: View {
                     }
                     try requireCurrentSessionAttempt(generation)
                 }
+                return claimed
+            }
+            // The experimental NVST transport attaches to the native allocation directly, so
+            // the WebRTC claim is deferred and only performed if NVST cannot start. Sessions
+            // that were already claimed (continued or resumed) stay on WebRTC.
+            let attemptsNVST = settings.experimentalNVSTTransport
+                && requiresWebRTCClaim
+                && !sessionInfo.nvstEndpoints.isEmpty
+            if requiresWebRTCClaim, !attemptsNVST {
+                sessionInfo = try await claimWebRTC()
             }
 
-            streamLog.info("startSession: queue cleared after confirmed ready responses, connecting WebRTC")
+            streamLog.info("startSession: queue cleared after confirmed ready responses, connecting \(attemptsNVST ? "NVST" : "WebRTC", privacy: .public)")
             streamLog.info("startSession: serverIp=\(sessionInfo.serverIp), signalingUrl=\(sessionInfo.signalingUrl)")
             viewModel.recordPlayed(game)
             _ = sessionOrchestrator.beginConnection(for: orchestrationAttempt)
@@ -1065,7 +1077,8 @@ struct StreamView: View {
                 accountAllowsHDR: viewModel.subscription?.allowsHDR,
                 membershipTier: currentMembershipTier,
                 sessionStartedAt: persistedSessionStart(for: sessionInfo),
-                supportedControls: supportedControls(for: connectedAppId)
+                supportedControls: supportedControls(for: connectedAppId),
+                webRTCFallback: attemptsNVST ? claimWebRTC : nil
             )
         } catch is CancellationError {
             return

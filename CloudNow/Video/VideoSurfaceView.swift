@@ -223,6 +223,19 @@ final class VideoSurfaceView: UIView {
         }
     }
 
+    /// Entry point for frames decoded outside a WebRTC track (the experimental NVST transport).
+    /// The returned closure may be called from any thread; frames take the same mailbox, pacing,
+    /// format-inspection and diagnostics path as track frames.
+    func makeExternalFrameSink() -> @Sendable (LKRTCVideoFrame) -> Void {
+        let renderer = renderer
+        return { frame in renderer.renderFrame(frame) }
+    }
+
+    /// Clears the picture after an external frame source stops.
+    func resetExternalFrames() {
+        renderer.reset(preservingDisplayedImage: false)
+    }
+
     func captureDiagnostics(_ completion: @escaping @Sendable (VideoPipelineSnapshot) -> Void) {
         renderer.capturePerformanceMetrics { [pipelineDiagnostics] in
             completion(pipelineDiagnostics.snapshot())

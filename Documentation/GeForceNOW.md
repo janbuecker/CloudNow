@@ -274,6 +274,15 @@ decoder availability. Physical AV1 hardware playback remains unverified. If a
 decoder or conversion path omits color attachments, diagnostics report fallback
 or unknown instead of guessing.
 
+An experimental NVST transport can replace the WebRTC video path for newly
+created sessions. It negotiates over RTSPS, receives raw SRTP video on its own
+socket, and decodes with VideoToolbox, while a WebRTC peer connection keeps the
+data channels and stereo audio. Its SDP, RTSP, and input policy live under
+`CloudNow/GFN/NVST` and are GFN-only. Scope, limits, and fallback behavior are in
+[Streaming settings](StreamingSettings.md#experimental-nvst-transport). Decoded
+frames enter the same video surface as WebRTC frames, so HDR detection and the
+delivered-format rules above apply unchanged.
+
 Game audio, microphone behavior, and their user controls are also covered by
 [Streaming settings](StreamingSettings.md#geforce-now-settings). The shared audio
 device preserves the selected session audio mode through resume and restores
@@ -340,6 +349,8 @@ or dedicated-server overrides to those sessions.
   negotiation, decode, and display path must support it.
 - AV1 remains limited to SDR 8-bit BT.709 with hardware decoding when available
   and software decoding otherwise. Physical hardware playback requires validation.
+- The experimental NVST transport is unvalidated on Apple TV hardware and carries
+  only video, stereo audio, controller input, and rumble.
 - Local diagnostic export is unavailable on tvOS. Bounded diagnostics can be
   cleared but are not advertised as exportable.
 

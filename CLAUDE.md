@@ -109,6 +109,13 @@ graphs, dependency direction, and deterministic provider regression tests.
   GFN WebSocket path. `InputSender` owns GFN controller/keyboard/mouse/Siri
   Remote/text encoding. `GFNVideoDecoderFactory` and `GFNVideoDecoderH265`
   preserve H.265 Main10 and decoded color metadata.
+- `GFN/NVST` holds the experimental NVST transport (off by default, toggled in
+  stream-quality settings). `Protocol/` is the RTSPS, raw-SRTP video, FEC, and
+  VideoToolbox pipeline adapted from OpenNOW; `Transport/` is the WebRTC bundle
+  for data channels and audio plus the `GFNNVSTTransport` facade.
+  `GFNStreamController` attempts it only for newly created sessions and falls
+  back to the WebRTC claim. It carries video, stereo audio, controller input,
+  and rumble only.
 - `UI/MainTabView`, `GamesViewModel`, `HomeView`, `LibraryView`, `StoreView`,
   `SettingsView`, and `StreamView` are the established GFN experience. They are
   not shared Xbox view models.

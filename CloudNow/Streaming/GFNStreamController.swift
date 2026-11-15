@@ -170,6 +170,13 @@ nonisolated struct StreamStats: Equatable {
     var totalFramesDropped: Int = 0
     var totalPacketsLost: Int = 0
     var totalFreezeDurationMs: Double = 0
+    /// "WebRTC" or "NVST"; empty until a transport is connected.
+    var transport: String = ""
+    /// NVST only: packets rebuilt from forward error correction instead of retransmission.
+    var fecRecoveredPackets: Int = 0
+    var totalFecRecoveredPackets: Int = 0
+    /// NVST only: keyframes requested after unrecoverable loss.
+    var totalKeyframeRequests: Int = 0
 }
 
 /// Audio metrics surfaced in the statistics HUD, refreshed once per stats tick.
@@ -398,6 +405,13 @@ final class GFNStreamController: NSObject {
     private var videoStatsRequestInFlight = false
     private var connectionStatsRequestInFlight = false
     private var wasStreaming = false
+    // Experimental NVST transport. All of it is nil/idle on the WebRTC path.
+    private var nvstTransport: GFNNVSTTransport?
+    private var nvstInputChannel: GFNNVSTInputChannel?
+    private var nvstEventTask: Task<Void, Never>?
+    private var nvstStatsRequestInFlight = false
+    private var previousNVSTStats: GFNNVSTStatsSnapshot?
+    private let nvstFrameRelay = GFNNVSTFrameRelay()
     private var reconnectAttempt = 0
     private var reconnectTask: Task<Void, Never>?
     private static let maxReconnectAttempts = 3
@@ -420,8 +434,10 @@ final class GFNStreamController: NSObject {
         accountAllowsHDR: Bool? = nil,
         membershipTier: String? = nil,
         sessionStartedAt: Date? = nil,
-        supportedControls: [String]? = nil
+        supportedControls: [String]? = nil,
+        webRTCFallback: (@MainActor () async throws -> SessionInfo)? = nil
     ) async {
+        var session = session
         // Block if already active; allow from idle, disconnected, or failed (retry case)
         let currentState = state
         switch currentState {
@@ -485,6 +501,29 @@ final class GFNStreamController: NSObject {
             }
         }
 
+        // The caller passes a fallback only when it skipped the WebRTC claim for this session,
+        // which is what makes the allocation eligible for the experimental NVST transport.
+        if settings.experimentalNVSTTransport, let webRTCFallback {
+            switch await connectNVST(session: session, settings: settings, colorRequest: colorRequest, generation: generation) {
+            case .connected, .abandoned:
+                return
+            case let .unavailable(reason):
+                gfnLog.warning("connect: NVST unavailable (\(reason, privacy: .public)); claiming WebRTC")
+                do {
+                    session = try await webRTCFallback()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard connectionGeneration == generation, case .connecting = state else { return }
+                    state = .failed(message: error.localizedDescription)
+                    return
+                }
+                guard connectionGeneration == generation, case .connecting = state else { return }
+                sessionInfo = session
+            }
+        }
+        updateStats { $0.transport = "WebRTC" }
+
         let microphoneAuthorized = await requestMicrophonePermissionIfNeeded()
         guard connectionGeneration == generation,
               sessionInfo?.sessionId == session.sessionId,
@@ -532,6 +571,7 @@ final class GFNStreamController: NSObject {
         }
         view.inputHandler = inputSender
         view.menuPressHandler = { [weak self] in self?.handleMenuPress() }
+        nvstFrameRelay.setSink(view.makeExternalFrameSink())
     }
 
     /// Sets the statistics HUD level. Core stream health remains sampled for the pause menu,
@@ -772,6 +812,8 @@ final class GFNStreamController: NSObject {
         inputSendQueue.sync {}
         signaling?.disconnect()
         signaling = nil
+        tearDownNVST(resetPicture: true)
+        nvstFrameRelay.setSink(nil)
         videoView?.videoTrack = nil
         let activePeerConnection = peerConnection
         setActivePeerConnection(nil)
@@ -845,7 +887,10 @@ final class GFNStreamController: NSObject {
 
         state = .reconnecting(attempt: attempt)
 
-        // Tear down current peer connection before reconnecting
+        // Tear down current peer connection before reconnecting. A failed NVST stream is
+        // reclaimed through the WebRTC resume path, so it is torn down here as well.
+        tearDownNVST(resetPicture: false)
+        updateStats { $0.transport = "WebRTC" }
         inputSender?.stop()
         inputSendQueue.sync {}
         videoView?.inputHandler = nil
@@ -1555,6 +1600,10 @@ final class GFNStreamController: NSObject {
     }
 
     private func collectStats() {
+        if let nvstTransport {
+            collectNVSTStats(from: nvstTransport)
+            return
+        }
         guard let peerConnection else { return }
         if statsMode != .off || diagnosticsEnabled {
             collectInputStats()
@@ -1898,14 +1947,23 @@ final class GFNStreamController: NSObject {
         next.totalFramesDropped = Int(max(0, sample.framesDropped))
         next.totalPacketsLost = Int(max(0, sample.packetsLost))
         next.totalFreezeDurationMs = max(0, sample.totalFreezeDurationSeconds) * 1000
-        let decoder = CloudVideoDecoderCounters.shared.snapshot()
-        next.decodeP99Ms = decoder.p99DecodeMs
-        next.decodeMaxMs = decoder.maxDecodeMs
-        next.decoderSessionBuilds = decoder.sessionBuilds
-        next.decoderSessionReuses = decoder.sessionReuses
-        next.hardwareDecoderConfirmed = decoder.isHardwareAccelerated
+        Self.applyDecoderCounters(to: &next)
 
         previousVideoStats = sample
+        publishVideoStats(next)
+    }
+
+    private static func applyDecoderCounters(to stats: inout StreamStats) {
+        let decoder = CloudVideoDecoderCounters.shared.snapshot()
+        stats.decodeP99Ms = decoder.p99DecodeMs
+        stats.decodeMaxMs = decoder.maxDecodeMs
+        stats.decoderSessionBuilds = decoder.sessionBuilds
+        stats.decoderSessionReuses = decoder.sessionReuses
+        stats.hardwareDecoderConfirmed = decoder.isHardwareAccelerated
+    }
+
+    /// Publishes one video statistics tick and extends the HUD graph histories.
+    private func publishVideoStats(_ next: StreamStats) {
         if next != stats {
             stats = next
         }
@@ -1915,6 +1973,67 @@ final class GFNStreamController: NSObject {
         pingHistory = pingSamples.elements
         fpsHistory = fpsSamples.elements
         bitrateHistory = bitrateSamples.elements
+    }
+
+    private func markStreamingStarted() {
+        wasStreaming = true
+        reconnectAttempt = 0
+        state = .streaming
+        if streamingStartedAt == nil {
+            let connectedAt = Date()
+            streamingStartedAt = connectedAt
+            let startedAt = sessionStartedAt ?? connectedAt
+            sessionStartedAt = startedAt
+            sessionCountdown = GFNSessionCountdown(
+                membershipTier: membershipTier,
+                startedAt: startedAt
+            )
+        }
+        startStatsTimer()
+    }
+
+    /// Builds, configures and starts the input sender for either transport's channel.
+    private func startInputSender(
+        channel: any DataChannelSender,
+        protocolVersion: Int,
+        sonyGamepadEnabled: Bool
+    ) -> InputSender {
+        let sender = InputSender(channel: channel)
+        sender.configure(
+            protocolVersion: protocolVersion,
+            deadzone: Float(settings.controllerDeadzone),
+            overlayTriggerButton: settings.overlayTriggerButton,
+            textInputTriggerSequence: settings.textInputTriggerSequence,
+            textInputTriggerDelayMs: settings.textInputTriggerDelayMs,
+            keyboardLayout: settings.keyboardLayout,
+            steamOverlayGestureEnabled: settings.enableSteamOverlayGesture,
+            remoteMode: settings.defaultRemoteInputMode,
+            rumbleEnabled: settings.rumbleEnabled,
+            rumbleIntensity: Float(settings.rumbleIntensity),
+            sonyGamepadEnabled: sonyGamepadEnabled
+        )
+        remoteMode = settings.defaultRemoteInputMode
+        videoView?.gamepadModeActive = remoteMode != .gamepadMouse
+        sender.menuToggleHandler = { [weak self, weak sender] in
+            guard let self, inputSender === sender else { return }
+            handleMenuPress()
+        }
+        sender.onRemoteModeChanged = { [weak self, weak sender] mode in
+            guard let self, inputSender === sender else { return }
+            remoteMode = mode
+            videoView?.gamepadModeActive = mode != .gamepadMouse
+        }
+        sender.controllerKeyboardShortcutHandler = { [weak self, weak sender] in
+            guard let self, let sender, inputSender === sender else { return }
+            beginControllerTextEntry()
+        }
+        sender.start()
+        if let previousInputSender = inputSender, previousInputSender !== sender {
+            invalidateControllerTextEntryReplay()
+            previousInputSender.stop()
+        }
+        inputSender = sender
+        return sender
     }
 
     private func applyDecodedVideoFormat(_ format: DecodedVideoFormat) {
@@ -2163,20 +2282,7 @@ extension GFNStreamController: LKRTCPeerConnectionDelegate {
             guard let self, peerConnection === sourcePeerConnection else { return }
             switch newState {
             case .connected, .completed:
-                wasStreaming = true
-                reconnectAttempt = 0
-                state = .streaming
-                if streamingStartedAt == nil {
-                    let connectedAt = Date()
-                    streamingStartedAt = connectedAt
-                    let startedAt = sessionStartedAt ?? connectedAt
-                    sessionStartedAt = startedAt
-                    sessionCountdown = GFNSessionCountdown(
-                        membershipTier: membershipTier,
-                        startedAt: startedAt
-                    )
-                }
-                startStatsTimer()
+                markStreamingStarted()
             case .disconnected:
                 stopStatsTimer()
                 if serverStopped {
@@ -2411,45 +2517,15 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
             inputReady = true
             protocolVersion = negotiatedVersion
             gfnLog.info("[DataChannel] Input ready — starting InputSender (protocol v\(negotiatedVersion, privacy: .public))")
-            let sender = InputSender(channel: self)
-            sender.configure(
+            let sender = startInputSender(
+                channel: self,
                 protocolVersion: negotiatedVersion,
-                deadzone: Float(settings.controllerDeadzone),
-                overlayTriggerButton: settings.overlayTriggerButton,
-                textInputTriggerSequence: settings.textInputTriggerSequence,
-                textInputTriggerDelayMs: settings.textInputTriggerDelayMs,
-                keyboardLayout: settings.keyboardLayout,
-                steamOverlayGestureEnabled: settings.enableSteamOverlayGesture,
-                remoteMode: settings.defaultRemoteInputMode,
-                rumbleEnabled: settings.rumbleEnabled,
-                rumbleIntensity: Float(settings.rumbleIntensity),
                 sonyGamepadEnabled: GFNSonyGamepad.isSupported(
                     protocolVersion: negotiatedVersion,
                     gameSupportsDualShock: gameSupportsDualShock,
                     serverHidMask: serverHidMask
                 )
             )
-            remoteMode = settings.defaultRemoteInputMode
-            videoView?.gamepadModeActive = remoteMode != .gamepadMouse
-            sender.menuToggleHandler = { [weak self, weak sender] in
-                guard let self, inputSender === sender else { return }
-                handleMenuPress()
-            }
-            sender.onRemoteModeChanged = { [weak self, weak sender] mode in
-                guard let self, inputSender === sender else { return }
-                remoteMode = mode
-                videoView?.gamepadModeActive = mode != .gamepadMouse
-            }
-            sender.controllerKeyboardShortcutHandler = { [weak self, weak sender] in
-                guard let self, let sender, inputSender === sender else { return }
-                beginControllerTextEntry()
-            }
-            sender.start()
-            if let previousInputSender = inputSender, previousInputSender !== sender {
-                invalidateControllerTextEntryReplay()
-                previousInputSender.stop()
-            }
-            inputSender = sender
             inputSendQueue.async { [weak self, sender] in
                 self?.inputSendState.withLock { state in
                     guard state.reliableChannel === dataChannel else { return }
@@ -2499,6 +2575,199 @@ private extension GFNStreamController {
         inputSender?.setPaused(
             controllerTextEntryReplayLifecycle.inputPaused(overlayPaused: overlayInputPaused)
         )
+    }
+}
+
+// MARK: - Experimental NVST transport
+
+private enum GFNNVSTConnectOutcome {
+    /// NVST is streaming.
+    case connected
+    /// The attempt was superseded by a newer connect or a disconnect; do nothing further.
+    case abandoned
+    /// NVST could not start; the caller should claim the WebRTC transport instead.
+    case unavailable(String)
+}
+
+private extension GFNStreamController {
+    /// The bare gamepad report layout the NVST transport rewrites onto its input channel.
+    static let nvstInputProtocolVersion = 2
+
+    func connectNVST(
+        session: SessionInfo,
+        settings: StreamSettings,
+        colorRequest: StreamColorRequest,
+        generation: UInt64
+    ) async -> GFNNVSTConnectOutcome {
+        let displayMaxRefreshRate = videoView?.window?.screen.maximumFramesPerSecond ?? settings.fps
+        guard let request = GFNNVSTRequestBuilder.makeRequest(
+            session: session,
+            settings: settings,
+            colorRequest: colorRequest,
+            displayMaxRefreshRate: displayMaxRefreshRate
+        ) else {
+            return .unavailable("session advertises no NVST endpoint")
+        }
+        _ = configureAudioSession(microphoneRequested: false)
+        let relay = nvstFrameRelay
+        let transport = GFNNVSTTransport(
+            request: request,
+            peerConnectionFactory: CloudRTCRuntime.peerConnectionFactory,
+            frameSink: { pixelBuffer, rtpTimestamp, _ in
+                relay.deliver(pixelBuffer, rtpTimestamp: rtpTimestamp)
+            },
+            log: { message in
+                gfnLog.info("[NVST] \(message, privacy: .private)")
+            }
+        )
+        nvstTransport = transport
+        gfnLog.info("connect: negotiating NVST")
+        do {
+            try await transport.connect()
+        } catch {
+            await transport.disconnect()
+            guard connectionGeneration == generation, nvstTransport === transport else { return .abandoned }
+            tearDownNVST(resetPicture: true)
+            guard case .connecting = state else { return .abandoned }
+            return .unavailable(String(describing: error))
+        }
+        guard connectionGeneration == generation, nvstTransport === transport, case .connecting = state else {
+            if nvstTransport === transport {
+                tearDownNVST(resetPicture: true)
+            } else {
+                await transport.disconnect()
+            }
+            return .abandoned
+        }
+        gfnLog.info("connect: NVST streaming")
+        updateStats {
+            $0.transport = "NVST"
+            $0.selectedNetworkPath = "direct_udp"
+        }
+        nvstEventTask = Task { @MainActor [weak self] in
+            for await event in transport.events {
+                guard let self, nvstTransport === transport else { return }
+                handleNVSTEvent(event, from: transport)
+            }
+        }
+        markStreamingStarted()
+        return .connected
+    }
+
+    func handleNVSTEvent(_ event: GFNNVSTEvent, from transport: GFNNVSTTransport) {
+        switch event {
+        case .inputReady:
+            startNVSTInput(on: transport)
+        case let .haptics(playerIndex, leftMotor, rightMotor, _):
+            // The left motor is the low-frequency (strong) one, matching the WebRTC rumble path.
+            inputSender?.applyRumble(controllerId: playerIndex, weak: rightMotor, strong: leftMotor)
+        case let .hdrModeChanged(enabled):
+            videoColorLog.info("NVST seat HDR mode enabled=\(enabled, privacy: .public)")
+        case let .sessionTerminated(code, name):
+            gfnLog.info("NVST seat ended the session code=\(code, privacy: .public) name=\(name ?? "unknown", privacy: .public)")
+            serverStopped = true
+            stopStatsTimer()
+            tearDownNVST(resetPicture: false)
+            state = .sessionEnded
+        case let .failed(message):
+            gfnLog.error("NVST transport failed: \(message, privacy: .public)")
+            stopStatsTimer()
+            tearDownNVST(resetPicture: false)
+            if wasStreaming {
+                // Recovery reclaims the allocation through the WebRTC resume path.
+                attemptReconnect()
+            } else {
+                state = .failed(message: message)
+            }
+        }
+    }
+
+    func startNVSTInput(on transport: GFNNVSTTransport) {
+        guard !inputReady else { return }
+        let channel = GFNNVSTInputChannel { [weak transport] report in
+            transport?.sendGamepadReport(report) ?? false
+        }
+        nvstInputChannel = channel
+        inputReady = true
+        protocolVersion = Self.nvstInputProtocolVersion
+        gfnLog.info("[NVST] Input ready — starting InputSender")
+        let sender = startInputSender(
+            channel: channel,
+            protocolVersion: Self.nvstInputProtocolVersion,
+            sonyGamepadEnabled: false
+        )
+        videoView?.inputHandler = sender
+        syncInputPauseState()
+    }
+
+    /// Idempotent. The transport's own teardown is asynchronous and does not block the UI.
+    func tearDownNVST(resetPicture: Bool) {
+        nvstEventTask?.cancel()
+        nvstEventTask = nil
+        nvstStatsRequestInFlight = false
+        previousNVSTStats = nil
+        nvstInputChannel = nil
+        guard let transport = nvstTransport else { return }
+        nvstTransport = nil
+        if resetPicture {
+            videoView?.resetExternalFrames()
+        }
+        Task { await transport.disconnect() }
+    }
+
+    func collectNVSTStats(from transport: GFNNVSTTransport) {
+        if statsMode != .off || diagnosticsEnabled, let counters = nvstInputChannel?.snapshot() {
+            updateStats {
+                $0.inputGenerated = counters.generated
+                $0.inputSubmitted = counters.generated
+                $0.inputAccepted = counters.accepted
+                $0.inputDropped = counters.dropped
+                $0.inputChannelState = "open"
+            }
+        }
+        guard !nvstStatsRequestInFlight else { return }
+        nvstStatsRequestInFlight = true
+        let generation = statsGeneration
+        Task { @MainActor [weak self] in
+            let snapshot = await transport.statsSnapshot()
+            guard let self, nvstTransport === transport else { return }
+            nvstStatsRequestInFlight = false
+            guard statsGeneration == generation else { return }
+            applyNVSTStats(snapshot)
+        }
+    }
+
+    func applyNVSTStats(_ sample: GFNNVSTStatsSnapshot) {
+        let delta = GFNNVSTStatsDelta(current: sample, previous: previousNVSTStats)
+        previousNVSTStats = sample
+        var next = stats
+        next.transport = "NVST"
+        next.fps = sample.framesPerSecond
+        next.resolutionWidth = sample.width
+        next.resolutionHeight = sample.height
+        next.codec = sample.codec
+        next.bitrateKbps = sample.bitrateKbps
+        next.rttMs = sample.roundTripMs
+        next.jitterMs = sample.jitterMs
+        next.packetLossPercent = sample.packetLossPercent
+        next.decodeTimeMs = sample.decodeTimeMs
+        if sample.gameFps > 0 {
+            next.gameFps = sample.gameFps
+        }
+        next.framesDropped = delta.framesDropped
+        next.nackCount = delta.nacks
+        next.pliCount = delta.keyframeRequests
+        next.fecRecoveredPackets = delta.fecRecoveredPackets
+        next.totalFramesDropped = Int(clamping: sample.framesDropped)
+        next.totalPacketsLost = Int(clamping: sample.packetsLost)
+        next.totalFecRecoveredPackets = Int(clamping: sample.packetsRecoveredByFEC)
+        next.totalKeyframeRequests = Int(clamping: sample.keyframeRequests)
+        next.decoderImplementation = "NVSTVideoToolbox"
+        Self.applyDecoderCounters(to: &next)
+        publishVideoStats(next)
+        updateAudioStats {
+            $0.jitterBufferCurrentMs = sample.audioJitterBufferMs
+        }
     }
 }
 

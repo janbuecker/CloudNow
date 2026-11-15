@@ -80,6 +80,8 @@ Any new per-frame work must be justified with a profile. Values derived from sta
 
 Describe this as zero-copy parsing or a lower-copy decode path. The complete H.265 path is not zero-copy.
 
+Both VideoToolbox decoders keep their decompression session when VideoToolbox accepts a changed format description, instead of rebuilding it for every parameter-set change. `CloudNow/Video/CloudVideoDecoderCounters.swift` records the decode tail (median, p99, max over the last 240 frames), session builds and reuses, and VideoToolbox's own hardware-decoder answer. The statistics HUD reads these once per second. How often GFN changes parameter sets on the WebRTC path has not been measured; the session-build counter in the diagnostics column exists to answer that.
+
 ### 8. Haptics and high-frequency logging
 
 Haptic delivery is isolated from rendering and input handling so device feedback does not block those paths. High-frequency rumble output is not written to general logs.
@@ -205,6 +207,8 @@ The repository coverage gate protects the capability model and adapter surface. 
 Retain an evidence record using the format in [ReleaseValidation.md](ReleaseValidation.md#evidence-record). The current open checks are:
 
 - Profile a live 4K60 GeForce NOW HEVC stream on Apple TV, including decode and render p95, dropped frames, AV delay, CPU, resident memory, and glass-to-glass latency.
+- Compare CPU, resident memory, decode p99, and dropped frames between the WebRTC transport and the experimental NVST transport on the same title, resolution, and network. NVST's resource saving is a hypothesis until this is recorded.
+- Confirm on hardware that the NVST transport connects, that its WebRTC fallback and reconnect work, and that HDR10 and 4:4:4 are detected from its decoded buffers.
 - Use SwiftUI Instruments to confirm that loading progress, queue-ad bookkeeping, and session-expiry updates invalidate only their intended leaf views.
 - Repeat stream entry and exit for 20 cycles and inspect Memory Graph results after the current teardown hardening.
 - Run multi-hour input diagnostics and confirm the sample history and process memory remain stable.

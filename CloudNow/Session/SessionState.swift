@@ -815,6 +815,9 @@ nonisolated struct SessionInfo {
     var controlServerIp: String?
     /// Server-accepted dynamic range, preserved when attaching to an existing allocation.
     var acceptedSdrHdrMode: Int?
+    /// Every CloudMatch connection entry, unmodified. The experimental NVST transport reads
+    /// its RTSPS control endpoint from here; the WebRTC path uses the fields above.
+    var nvstEndpoints: [GFNNVSTConnectionEndpoint] = []
 
     /// True while the session is sitting in the GFN queue (no timeout applies).
     var isInQueue: Bool {

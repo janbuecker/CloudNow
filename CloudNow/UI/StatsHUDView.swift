@@ -417,6 +417,9 @@ private struct CoreStatsColumn: View {
                     label: L10n.text("connection"),
                     value: L10n.text(stats.selectedNetworkPath)
                 )
+                if !stats.transport.isEmpty {
+                    StatsRow(label: L10n.text("transport"), value: stats.transport)
+                }
                 StatsRow(
                     label: L10n.text("server_location"),
                     value: serverLocation
@@ -439,6 +442,12 @@ private struct CoreStatsColumn: View {
                     label: L10n.text("drops_freezes"),
                     value: "\(stats.framesDropped) / \(stats.freezeCount)"
                 )
+                if stats.transport == "NVST" {
+                    StatsRow(
+                        label: L10n.text("fec_recovered"),
+                        value: "\(stats.fecRecoveredPackets) / \(stats.totalFecRecoveredPackets)"
+                    )
+                }
                 StatsRow(
                     label: L10n.text("session_drops_loss"),
                     value: "\(stats.totalFramesDropped) / \(stats.totalPacketsLost)"
@@ -587,6 +596,12 @@ private struct DebugStatsColumn: View {
                 StatsRow(
                     label: L10n.text("decoder"),
                     value: decoderValue
+                )
+            }
+            if stats.transport == "NVST" {
+                StatsRow(
+                    label: L10n.text("keyframe_requests"),
+                    value: String(stats.totalKeyframeRequests)
                 )
             }
             if stats.decoderSessionBuilds > 0 {
