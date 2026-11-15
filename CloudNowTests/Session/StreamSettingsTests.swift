@@ -29,6 +29,7 @@ struct StreamSettingsTests {
         #expect(settings.gameLanguage == StreamSettings.automaticGameLanguage)
         #expect(settings.enableL4S)
         #expect(!settings.adaptiveFramePacing)
+        #expect(!settings.experimentalNVSTTransport)
         #expect(!settings.micEnabled)
         #expect(settings.rumbleEnabled)
         #expect(settings.rumbleIntensity == 1)
@@ -120,6 +121,7 @@ struct StreamSettingsTests {
         expected.gameLanguage = "fr_FR"
         expected.enableL4S = true
         expected.adaptiveFramePacing = true
+        expected.experimentalNVSTTransport = true
         expected.micEnabled = true
         expected.rumbleEnabled = false
         expected.rumbleIntensity = 1.5
@@ -219,6 +221,18 @@ struct StreamSettingsTests {
         #expect(decoded.normalizedForClient.adaptiveFramePacing == enabled)
     }
 
+    @Test("Experimental NVST transport survives settings persistence", arguments: [false, true])
+    func experimentalNVSTTransportPersistence(enabled: Bool) throws {
+        var settings = StreamSettings()
+        settings.experimentalNVSTTransport = enabled
+
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: encoded)
+
+        #expect(decoded.experimentalNVSTTransport == enabled)
+        #expect(decoded.normalizedForClient.experimentalNVSTTransport == enabled)
+    }
+
     @Test("Audio preferences survive settings persistence", arguments: AudioFormatPreference.allCases)
     func audioPreferencePersistence(format: AudioFormatPreference) throws {
         var settings = StreamSettings()
@@ -255,6 +269,7 @@ struct StreamSettingsTests {
         #expect(decoded.codec == .h264)
         #expect(!decoded.enableL4S)
         #expect(!decoded.adaptiveFramePacing)
+        #expect(!decoded.experimentalNVSTTransport)
     }
 
     @Test("Legacy color quality migrates and decoded values still clamp")

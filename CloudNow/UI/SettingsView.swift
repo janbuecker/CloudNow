@@ -1066,6 +1066,17 @@ struct SettingsView: View {
                         .padding(.vertical, 8)
                     }
                     .accessibilityIdentifier("settings.stream-quality.adaptive-frame-pacing")
+
+                    Toggle(isOn: $vm.streamSettings.experimentalNVSTTransport) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.text("experimental_nvst_transport"))
+                            Text(L10n.text("experimental_nvst_transport_description"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .accessibilityIdentifier("settings.stream-quality.experimental-nvst-transport")
                 }
 
                 Section(L10n.text("server_location")) {

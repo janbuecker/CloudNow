@@ -34,6 +34,10 @@ nonisolated struct StreamSettings: Codable, Equatable {
     var gameLanguage: String = Self.defaultGameLanguage
     var enableL4S: Bool = true
     var adaptiveFramePacing: Bool = false
+    /// Experimental: negotiate the stream over RTSPS and receive video as raw SRTP decoded
+    /// directly by VideoToolbox, instead of through the WebRTC video pipeline. Input and
+    /// audio still ride a WebRTC peer connection. Falls back to WebRTC when unavailable.
+    var experimentalNVSTTransport: Bool = false
     var micEnabled: Bool = false
     var rumbleEnabled: Bool = true
     /// Rumble power multiplier (0.0–2.0, 1.0 = default). Higher values stress controller motors.
@@ -160,6 +164,7 @@ extension StreamSettings {
         case resolution, fps, maxBitrateKbps, codec, colorPreference, chromaFormat, keyboardLayout
         case gameLanguage, enableL4S, micEnabled, rumbleEnabled, rumbleIntensity, controllerDeadzone, overlayTriggerButton
         case adaptiveFramePacing
+        case experimentalNVSTTransport
         case textInputTriggerSequence, textInputTriggerDelayMs
         case defaultRemoteInputMode, preferredZoneUrl
         case serverRoutingMode, preferredRegionName, preferredRegionAddress
@@ -195,6 +200,7 @@ extension StreamSettings {
         gameLanguage = try c.decodeIfPresent(String.self, forKey: .gameLanguage) ?? d.gameLanguage
         enableL4S = try c.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? d.enableL4S
         adaptiveFramePacing = try c.decodeIfPresent(Bool.self, forKey: .adaptiveFramePacing) ?? d.adaptiveFramePacing
+        experimentalNVSTTransport = try c.decodeIfPresent(Bool.self, forKey: .experimentalNVSTTransport) ?? d.experimentalNVSTTransport
         micEnabled = try c.decodeIfPresent(Bool.self, forKey: .micEnabled) ?? d.micEnabled
         rumbleEnabled = try c.decodeIfPresent(Bool.self, forKey: .rumbleEnabled) ?? d.rumbleEnabled
         let storedRumbleIntensity = try c.decodeIfPresent(
@@ -281,6 +287,7 @@ extension StreamSettings {
         try c.encode(gameLanguage, forKey: .gameLanguage)
         try c.encode(enableL4S, forKey: .enableL4S)
         try c.encode(adaptiveFramePacing, forKey: .adaptiveFramePacing)
+        try c.encode(experimentalNVSTTransport, forKey: .experimentalNVSTTransport)
         try c.encode(micEnabled, forKey: .micEnabled)
         try c.encode(rumbleEnabled, forKey: .rumbleEnabled)
         try c.encode(rumbleIntensity, forKey: .rumbleIntensity)

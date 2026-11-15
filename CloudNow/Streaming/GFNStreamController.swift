@@ -159,6 +159,17 @@ nonisolated struct StreamStats: Equatable {
     /// messages (0 until the first message arrives). The official client shows this
     /// alongside the stream FPS.
     var gameFps: Double = 0
+    /// Tail of the app decoder's synchronous VideoToolbox calls over the recent window.
+    var decodeP99Ms: Double = 0
+    var decodeMaxMs: Double = 0
+    var decoderSessionBuilds: Int = 0
+    var decoderSessionReuses: Int = 0
+    /// VideoToolbox's own answer; `nil` until a session exists.
+    var hardwareDecoderConfirmed: Bool?
+    /// Cumulative values since the stream connected, unlike the interval fields above.
+    var totalFramesDropped: Int = 0
+    var totalPacketsLost: Int = 0
+    var totalFreezeDurationMs: Double = 0
 }
 
 /// Audio metrics surfaced in the statistics HUD, refreshed once per stats tick.
@@ -450,6 +461,7 @@ final class GFNStreamController: NSObject {
         setDiagnosticsEnabled(settings.diagnosticsEnabled)
         microphoneEnabledForConnection = false
         microphoneAuthorizedForConnection = false
+        CloudVideoDecoderCounters.shared.reset()
         var initialStats = StreamStats()
         initialStats.gpuType = session.gpuType ?? ""
         initialStats.serverZone = Self.zoneShortName(from: session.zone)
@@ -1882,6 +1894,16 @@ final class GFNStreamController: NSObject {
                 previous.retransmittedPackets
             )
         }
+
+        next.totalFramesDropped = Int(max(0, sample.framesDropped))
+        next.totalPacketsLost = Int(max(0, sample.packetsLost))
+        next.totalFreezeDurationMs = max(0, sample.totalFreezeDurationSeconds) * 1000
+        let decoder = CloudVideoDecoderCounters.shared.snapshot()
+        next.decodeP99Ms = decoder.p99DecodeMs
+        next.decodeMaxMs = decoder.maxDecodeMs
+        next.decoderSessionBuilds = decoder.sessionBuilds
+        next.decoderSessionReuses = decoder.sessionReuses
+        next.hardwareDecoderConfirmed = decoder.isHardwareAccelerated
 
         previousVideoStats = sample
         if next != stats {

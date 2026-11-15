@@ -440,12 +440,16 @@ private struct CoreStatsColumn: View {
                     value: "\(stats.framesDropped) / \(stats.freezeCount)"
                 )
                 StatsRow(
+                    label: L10n.text("session_drops_loss"),
+                    value: "\(stats.totalFramesDropped) / \(stats.totalPacketsLost)"
+                )
+                StatsRow(
                     label: L10n.text("jitter_buffer"),
                     value: "\(Int(stats.jitterBufferDelayMs)) / \(Int(stats.jitterBufferTargetDelayMs)) ms"
                 )
                 StatsRow(
                     label: L10n.text("decode_time"),
-                    value: String(format: "%.2f ms", stats.decodeTimeMs)
+                    value: decodeTimeValue
                 )
                 StatsRow(
                     label: L10n.text("processing_delay"),
@@ -503,6 +507,13 @@ private struct CoreStatsColumn: View {
         return L10n.text("unknown")
     }
 
+    /// Mean from the transport plus the app decoder's own tail, when it has samples.
+    private var decodeTimeValue: String {
+        let mean = String(format: "%.2f ms", stats.decodeTimeMs)
+        guard stats.decodeP99Ms > 0 else { return mean }
+        return mean + String(format: " · p99 %.2f", stats.decodeP99Ms)
+    }
+
     private var videoFormatValue: String {
         var parts: [String] = []
         if !stats.codec.isEmpty {
@@ -512,8 +523,11 @@ private struct CoreStatsColumn: View {
         if let chromaFormat = colorState.decodedChromaFormat {
             parts.append(chromaFormat.label)
         }
-        if stats.powerEfficientDecoder == true {
+        // VideoToolbox's readback wins over the transport's claim when it is available.
+        if stats.hardwareDecoderConfirmed ?? stats.powerEfficientDecoder == true {
             parts.append("HW")
+        } else if stats.hardwareDecoderConfirmed == false {
+            parts.append("SW")
         }
         return parts.joined(separator: " · ")
     }
@@ -573,6 +587,13 @@ private struct DebugStatsColumn: View {
                 StatsRow(
                     label: L10n.text("decoder"),
                     value: decoderValue
+                )
+            }
+            if stats.decoderSessionBuilds > 0 {
+                StatsRow(
+                    label: L10n.text("decoder_sessions"),
+                    value: "\(stats.decoderSessionBuilds) / \(stats.decoderSessionReuses) · max \(String(format: "%.1f ms", stats.decodeMaxMs))",
+                    warning: stats.decoderSessionBuilds > 1
                 )
             }
             if stats.inputDropped > 0 {
