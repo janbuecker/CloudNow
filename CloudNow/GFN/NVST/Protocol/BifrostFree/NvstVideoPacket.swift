@@ -34,9 +34,6 @@ nonisolated struct NvstRtpVideoPacket: Equatable, Sendable {
 
     struct NVSTVideoFlag: OptionSet, Equatable, Sendable {
         let rawValue: UInt8
-        init(rawValue: UInt8) {
-            self.rawValue = rawValue
-        }
 
         static let containsPicData = NVSTVideoFlag(rawValue: 0x01)
         static let endOfFrame = NVSTVideoFlag(rawValue: 0x02)

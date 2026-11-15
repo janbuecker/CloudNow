@@ -90,7 +90,9 @@ final nonisolated class NvstWebRtcBundle: NSObject, LKRTCPeerConnectionDelegate,
 
         /// The SCTP stream id this definition lands on when the whole list is created in order by
         /// the DTLS client: the even ids, ascending.
-        static func expectedStreamId(atIndex index: Int) -> Int { index * 2 }
+        static func expectedStreamId(atIndex index: Int) -> Int {
+            index * 2
+        }
     }
 
     static let controlChannelLabel = "control_channel_reliable"

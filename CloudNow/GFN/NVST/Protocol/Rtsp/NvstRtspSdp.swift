@@ -158,7 +158,8 @@ nonisolated enum NvstRtspSdp {
         String(format: "%024X", keyID)
     }
 
-    /// libsrtp master key||salt (AES-256 key + 12-byte salt = 88 hex chars).
+    // libsrtp master key||salt (AES-256 key + 12-byte salt = 88 hex chars).
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     static func packMasterKeySalt(aesKeyHex: String, keyID: UInt32) throws -> String {
         let key = aesKeyHex.trimmingCharacters(in: .whitespaces).uppercased()
         guard key.count == 64, key.allSatisfy(\.isHexDigit) else {

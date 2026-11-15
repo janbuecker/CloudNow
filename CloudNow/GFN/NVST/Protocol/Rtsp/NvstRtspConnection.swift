@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 
 /// The RTSP control channel the negotiator drives. Abstracted so the handshake can be
 /// exercised against recorded seat responses without a socket.

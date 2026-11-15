@@ -351,6 +351,7 @@ nonisolated struct NvstControlCommand: Equatable, Sendable {
     /// The payload decoded as UTF-8, bounded so one message cannot flood the log.
     func text(limit: Int = 600) -> String {
         let body = payload.prefix(limit)
+        // swiftlint:disable:next optional_data_string_conversion - reason: The decode must be lossy because the byte limit can split a multi-byte character.
         let decoded = String(decoding: body, as: UTF8.self)
         return payload.count > limit ? decoded + "…(\(payload.count) bytes)" : decoded
     }

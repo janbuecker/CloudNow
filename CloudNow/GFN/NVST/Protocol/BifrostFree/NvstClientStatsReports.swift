@@ -218,11 +218,6 @@ nonisolated struct NvstEcnFeedbackReport: Equatable, Sendable {
         let frameNumber: UInt32
         /// Percentage of the frame's packets that arrived CE-marked.
         let ceMarkedPercent: UInt8
-
-        init(frameNumber: UInt32, ceMarkedPercent: UInt8) {
-            self.frameNumber = frameNumber
-            self.ceMarkedPercent = ceMarkedPercent
-        }
     }
 
     let streamIndex: UInt16

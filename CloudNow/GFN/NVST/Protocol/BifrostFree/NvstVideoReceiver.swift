@@ -184,7 +184,9 @@ final nonisolated class NvstVideoReceiver: @unchecked Sendable {
     private let cipher: SrtpGcm8
     private let sessionSalt: Data
     private let tagLength: Int
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     private let srtcpMasterKey: Data
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     private let srtcpMasterSalt: Data
     private let reorderWindow: Int
     private let reassembler: NvstFrameReassembler

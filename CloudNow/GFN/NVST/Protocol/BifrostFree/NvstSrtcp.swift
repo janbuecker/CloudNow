@@ -17,12 +17,14 @@ nonisolated enum NvstSrtcp {
         let salt: Data
     }
 
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     private static func material(masterKey: Data, masterSalt: Data) throws -> Material {
         let sessionKey = try SrtpKeyDerivation.derive(key: masterKey, salt: masterSalt, label: rtcptKeyLabel, length: 32)
         let sessionSalt = try SrtpKeyDerivation.derive(key: masterKey, salt: masterSalt, label: rtcptSaltLabel, length: 12)
         return try Material(cipher: SrtpGcm8(key: sessionKey), salt: sessionSalt)
     }
 
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     static func seal(rtcpPacket: Data, masterKey: Data, masterSalt: Data, senderSSRC: UInt32, srtcpIndex: UInt32) throws -> Data {
         guard rtcpPacket.count > 8 else { throw SrtpCryptoError.cryptorError("RTCP packet has no encrypted payload.") }
         let material = try material(masterKey: masterKey, masterSalt: masterSalt)
@@ -53,6 +55,7 @@ nonisolated enum NvstSrtcp {
         return packet
     }
 
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     static func open(srtcpPacket: Data, masterKey: Data, masterSalt: Data, senderSSRC: UInt32) throws -> (rtcp: Data, index: UInt32) {
         guard srtcpPacket.count > 8 + 8 + 4 else { throw SrtpCryptoError.cryptorError("SRTCP packet too short.") }
         let header = srtcpPacket.prefix(8)

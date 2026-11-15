@@ -37,7 +37,8 @@ nonisolated enum NVSTSrtpProfile: String, Equatable, Sendable {
         }
     }
 
-    /// Master key length required, in bytes.
+    // Master key length required, in bytes.
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     var masterKeyLength: Int {
         switch self {
         case .aeadAes128Gcm, .aeadAes128Gcm8, .aesCm128HmacSha1_32, .aesCm128HmacSha1_80: 16
@@ -45,7 +46,8 @@ nonisolated enum NVSTSrtpProfile: String, Equatable, Sendable {
         }
     }
 
-    /// Master salt length required, in bytes.
+    // Master salt length required, in bytes.
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     var masterSaltLength: Int {
         switch self {
         case .aeadAes128Gcm, .aeadAes128Gcm8, .aeadAes256Gcm, .aeadAes256Gcm8: 12

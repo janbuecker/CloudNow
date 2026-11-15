@@ -276,6 +276,7 @@ nonisolated enum SrtpCryptor {
 /// SRTP key derivation (RFC 3711 §4.3.1): Counter-mode AES keyed by the master key with the
 /// 16-byte counter IV = master salt (byte 7 XOR label).
 nonisolated enum SrtpKeyDerivation {
+    // swiftlint:disable:next inclusive_language - reason: RFC 3711 names these SRTP inputs the master key and master salt.
     static func derive(key masterKey: Data, salt masterSalt: Data, label: UInt8, length: Int) throws -> Data {
         guard masterKey.count == 16 || masterKey.count == 32 else {
             throw SrtpCryptoError.invalidKeyLength

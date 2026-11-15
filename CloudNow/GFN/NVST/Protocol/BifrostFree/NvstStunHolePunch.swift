@@ -12,9 +12,6 @@ import Foundation
 nonisolated struct NvstSocketEndpoint: Equatable, Sendable {
     let host: String
     let port: UInt16
-    init(host: String, port: UInt16) {
-        self.host = host; self.port = port
-    }
 }
 
 nonisolated enum NvstStunError: LocalizedError, Equatable, Sendable {

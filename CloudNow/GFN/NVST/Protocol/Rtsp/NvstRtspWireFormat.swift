@@ -362,6 +362,7 @@ nonisolated enum NvstRtspText {
     /// Lossy UTF-8 decode: RTSP control traffic is ASCII, and a malformed byte must not
     /// abort the exchange.
     static func decode(_ data: Data) -> String {
+        // swiftlint:disable:next optional_data_string_conversion - reason: The fallback is deliberately lossy so a malformed byte cannot abort the exchange.
         String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
 }

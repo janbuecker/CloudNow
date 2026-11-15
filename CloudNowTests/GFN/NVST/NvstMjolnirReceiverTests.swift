@@ -1,0 +1,709 @@
+@testable import CloudNow
+import Foundation
+import Testing
+
+@Suite(.serialized)
+struct NvstMjolnirReceiverTests {
+    @Test func authenticatedPacketsReassembleIntoAnAnnexBAccessUnit() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let sof = NvstReceiverFixtures.packet(sequence: 1, frameIndex: 42, flags: 0x05, media: [0x00, 0x00, 0x00, 0x01, 0x65])
+        let eof = NvstReceiverFixtures.packet(sequence: 2, frameIndex: 42, flags: 0x03, media: [0x00, 0x00, 0x01, 0x41])
+
+        #expect(try NvstReceiverFixtures.frames(receiver.process(datagram: NvstReceiverFixtures.seal(sof, sequence: 1, handoff: handoff))).isEmpty)
+        let emitted = try NvstReceiverFixtures.frames(receiver.process(datagram: NvstReceiverFixtures.seal(eof, sequence: 2, handoff: handoff)))
+        #expect(emitted.count == 1)
+        #expect(emitted[0].bytes == Data([0x00, 0x00, 0x00, 0x01, 0x65, 0x00, 0x00, 0x01, 0x41]))
+        #expect(emitted[0].isKeyframe)
+        let stats = receiver.snapshot
+        #expect(stats.authenticatedPackets == 2)
+        #expect(stats.framesEmitted == 1)
+        #expect(stats.keyframesEmitted == 1)
+        #expect(stats.boundSSRC == NvstReceiverFixtures.mediaSSRC)
+    }
+
+    @Test func theSixteenByteTagProfileAuthenticatesToo() throws {
+        // The seat advertises AEAD_AES_256_GCM explicitly on some builds; the tag is 16 bytes
+        // there, not NVIDIA's default 8.
+        let handoff = NvstReceiverFixtures.makeHandoff(profile: .aeadAes256Gcm)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let unit = NvstReceiverFixtures.packet(sequence: 7, frameIndex: 1, flags: 0x07, media: [0x00, 0x00, 0x00, 0x01, 0x65])
+        let emitted = try NvstReceiverFixtures.frames(receiver.process(datagram: NvstReceiverFixtures.seal(unit, sequence: 7, handoff: handoff)))
+        #expect(emitted.count == 1)
+    }
+
+    @Test func aesCmProfilesAreRejectedRatherThanMisDecrypted() {
+        #expect(throws: NvstVideoReceiver.ReceiverError.unsupportedProfile("AES_CM_128_HMAC_SHA1_80")) {
+            _ = try NvstVideoReceiver(handoff: NvstReceiverFixtures.makeHandoff(profile: .aesCm128HmacSha1_80))
+        }
+    }
+
+    @Test func tamperedAndReplayedPacketsAreDropped() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let sof = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: 5, frameIndex: 9, flags: 0x05, media: [0x00, 0x00, 0x00, 0x01, 0x65]), sequence: 5, handoff: handoff)
+        #expect(NvstReceiverFixtures.frames(receiver.process(datagram: sof)).isEmpty)
+        // Same packet again: the replay window must reject it.
+        #expect(!NvstReceiverFixtures.drops(receiver.process(datagram: sof)).isEmpty)
+
+        var tampered = sof
+        tampered[tampered.count - 3] ^= 0x40
+        #expect(!NvstReceiverFixtures.drops(receiver.process(datagram: tampered)).isEmpty)
+    }
+
+    @Test func aPacketFromAForeignSsrcNeverJoinsTheStream() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        var foreign = NvstReceiverFixtures.packet(sequence: 1, frameIndex: 1, flags: 0x05, media: [0x00, 0x00, 0x00, 0x01, 0x65])
+        foreign.replaceSubrange(8 ..< 12, with: Data([0xDE, 0xAD, 0xBE, 0xEF]))
+        // Sealed under its own SSRC so authentication passes; only the handoff disagrees.
+        let datagram = try NvstReceiverFixtures.seal(foreign, sequence: 1, handoff: handoff, ssrc: 0xDEAD_BEEF)
+        let events = receiver.process(datagram: datagram)
+        #expect(NvstReceiverFixtures.drops(events).contains { $0.contains("SSRC") })
+        #expect(receiver.snapshot.boundSSRC == nil)
+    }
+
+    /// An unauthenticated datagram reached the replay window's index estimate before any
+    /// authentication ran, and while the rollover counter was still zero a sequence number more
+    /// than 32,768 above the highest accepted one estimated into an epoch that does not exist.
+    /// The resulting ROC did not fit the `UInt32` the GCM IV takes and trapped — a Swift
+    /// `fatalError`, which the caller's `catch` cannot intercept, so one packet on the video
+    /// socket terminated the app. The attacker needs the port, not the key.
+    @Test func anUnauthenticatedPacketFarAheadOfTheWindowIsDroppedRatherThanFatal() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        let first = try NvstReceiverFixtures.seal(
+            NvstReceiverFixtures.packet(sequence: 100, frameIndex: 1, flags: 0x07, media: media),
+            sequence: 100, handoff: handoff
+        )
+        #expect(NvstReceiverFixtures.frames(receiver.process(datagram: first)).count == 1)
+
+        // The header is plaintext, so all of it is attacker-controlled; only the payload and the
+        // trailing tag need the session key. Sequence 40,000 is 39,900 above the highest accepted.
+        var forged = NvstReceiverFixtures.packet(sequence: 40000, frameIndex: 2, flags: 0x07,
+                                                 media: [UInt8](repeating: 0x5A, count: 16))
+        forged.replaceSubrange(32 ..< forged.count, with: Data(repeating: 0xA5, count: forged.count - 32))
+        let forgedEvents = receiver.process(datagram: forged)
+
+        #expect(NvstReceiverFixtures.drops(forgedEvents).contains { $0.contains("authentication") })
+        #expect(NvstReceiverFixtures.frames(forgedEvents).isEmpty)
+        let stats = receiver.snapshot
+        #expect(stats.authenticatedPackets == 1)
+        #expect(stats.droppedPackets == 1)
+        // A forged packet must not age real ones out of the window, so the next real packet still
+        // authenticates at its own index.
+        let next = try NvstReceiverFixtures.seal(
+            NvstReceiverFixtures.packet(sequence: 101, frameIndex: 2, flags: 0x07, media: media),
+            sequence: 101, handoff: handoff
+        )
+        #expect(NvstReceiverFixtures.frames(receiver.process(datagram: next)).count == 1)
+        #expect(receiver.snapshot.authenticatedPackets == 2)
+    }
+
+    /// One lost packet used to take its whole reorder window with it: the finalizing flush
+    /// destroyed every packet buffered behind the gap, so a single loss cost 32 packets and the
+    /// frames they carried — uncounted, because the destroyed packets hit no drop counter.
+    @Test func aSingleLostPacketDeliversTheBufferedPacketsBehindIt() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        // A complete single-packet frame per sequence number. Sequence 2 never arrives.
+        let first = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: 1, frameIndex: 1, flags: 0x07, media: media), sequence: 1, handoff: handoff)
+        #expect(NvstReceiverFixtures.frames(receiver.process(datagram: first)).count == 1)
+        for sequence in UInt16(3) ... UInt16(5) {
+            let held = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07, media: media),
+                                                     sequence: sequence, handoff: handoff)
+            // Head-of-line blocked on the missing packet, not dropped.
+            #expect(NvstReceiverFixtures.frames(receiver.process(datagram: held)).isEmpty)
+        }
+        // Sequence 6 ages the gap past the window: 2 is finalized loss, 3...6 must all deliver.
+        let sixth = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: 6, frameIndex: 6, flags: 0x07, media: media), sequence: 6, handoff: handoff)
+        let events = receiver.process(datagram: sixth)
+        #expect(NvstReceiverFixtures.frames(events).count == 4)
+        #expect(NvstReceiverFixtures.recoveries(events) == 1)
+        let stats = receiver.snapshot
+        #expect(stats.framesEmitted == 5)
+        #expect(stats.recoveries == 1)
+        #expect(stats.finalizedLossPackets == 1)
+        #expect(stats.droppedPackets == 0)
+    }
+
+    /// A lost packet is requested while its gap is open, and the gap waits for the resend instead
+    /// of becoming loss once the reorder window passes it, so the frames behind it are not lost.
+    @Test func aRequestedPacketThatIsResentInTimeRepairsTheGap() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        func feed(_ sequence: UInt16) throws -> [NvstReceiveEvent] {
+            try receiver.process(datagram: NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07, media: media),
+                sequence: sequence, handoff: handoff
+            ))
+        }
+        func requested(_ events: [NvstReceiveEvent]) -> [UInt64] {
+            events.flatMap { event -> [UInt64] in
+                if case let .retransmissionWanted(indices) = event {
+                    return indices
+                } else {
+                    return []
+                }
+            }
+        }
+        _ = try feed(1)
+        #expect(try requested(feed(3)).isEmpty)
+        clock.withLock { $0 = NvstNackTracker.initialDelayNanoseconds }
+        #expect(try requested(feed(4)) == [2])
+        // Well past the four-packet window and the 64-packet RFC 3711 replay window.
+        for sequence in UInt16(5) ... UInt16(80) {
+            #expect(try NvstReceiverFixtures.recoveries(feed(sequence)) == 0)
+        }
+        let repaired = try feed(2)
+        #expect(NvstReceiverFixtures.frames(repaired).count == 79)
+        #expect(NvstReceiverFixtures.recoveries(repaired) == 0)
+        let stats = receiver.snapshot
+        #expect(stats.retransmissionRepairedPackets == 1)
+        #expect(stats.finalizedLossPackets == 0)
+        #expect(stats.replayedPackets == 0)
+    }
+
+    /// One request names at most 64 packets, so a wider gap asks for its first 64 and no more: a
+    /// packet counted as requested but never named would hold its gap open for nothing.
+    @Test func aWideGapRequestsOnlyWhatOneRequestCanName() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 128)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        func feed(_ sequence: UInt16) throws -> [NvstReceiveEvent] {
+            try receiver.process(datagram: NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07, media: media),
+                sequence: sequence, handoff: handoff
+            ))
+        }
+        _ = try feed(1)
+        _ = try feed(102)
+        clock.withLock { $0 = NvstNackTracker.initialDelayNanoseconds }
+        let requested = try feed(103).flatMap { event -> [UInt64] in
+            if case let .retransmissionWanted(indices) = event {
+                return indices
+            } else {
+                return []
+            }
+        }
+        #expect(requested == Array(2 ... 65))
+    }
+
+    /// A resend that never comes ends the wait: the gap is loss once its request has expired.
+    @Test func aRequestedPacketThatNeverArrivesBecomesLossAfterTheWait() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        func feed(_ sequence: UInt16) throws -> [NvstReceiveEvent] {
+            try receiver.process(datagram: NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07, media: media),
+                sequence: sequence, handoff: handoff
+            ))
+        }
+        _ = try feed(1)
+        _ = try feed(3)
+        clock.withLock { $0 = NvstNackTracker.initialDelayNanoseconds }
+        for sequence in UInt16(4) ... UInt16(8) {
+            #expect(try NvstReceiverFixtures.recoveries(feed(sequence)) == 0)
+        }
+        clock.withLock { $0 = NvstNackTracker.defaultWaitNanoseconds }
+        #expect(try NvstReceiverFixtures.recoveries(feed(9)) == 1)
+        #expect(receiver.snapshot.finalizedLossPackets == 1)
+    }
+
+    /// A second gap among the survivors finalizes on its own later packet rather than being
+    /// silently absorbed by the first flush.
+    @Test func interleavedGapsFinalizeIndependently() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let media: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        func feed(_ sequence: UInt16) throws -> [NvstReceiveEvent] {
+            try receiver.process(datagram: NvstReceiverFixtures.seal(
+                NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07, media: media),
+                sequence: sequence, handoff: handoff
+            ))
+        }
+        _ = try feed(1)
+        // 2 and 4 never arrive; 3 and 5 wait behind 2.
+        #expect(try NvstReceiverFixtures.frames(feed(3)).isEmpty)
+        #expect(try NvstReceiverFixtures.frames(feed(5)).isEmpty)
+        // 6 finalizes the loss of 2 and delivers 3; 4 is still an open gap holding 5 and 6.
+        #expect(try NvstReceiverFixtures.frames(feed(6)).count == 1)
+        // 8 finalizes the loss of 4 and delivers 5, 6 — 7 is now the open gap holding 8.
+        let events = try feed(8)
+        #expect(NvstReceiverFixtures.frames(events).count == 2)
+        let stats = receiver.snapshot
+        #expect(stats.finalizedLossPackets == 2)
+        #expect(stats.recoveries == 2)
+    }
+
+    /// A hole in the GS stream sequence with contiguous RTP delivery has no RTP packet to NACK:
+    /// it must ask for a keyframe, not a retransmission of an arbitrary sequence number.
+    @Test func aStreamSequenceHoleAsksForAKeyframeNotARetransmission() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let sof = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: 1, frameIndex: 7, flags: 0x05, media: [0x00, 0x00, 0x00, 0x01, 0x65]),
+                                                sequence: 1, handoff: handoff)
+        #expect(NvstReceiverFixtures.frames(receiver.process(datagram: sof)).isEmpty)
+        // Contiguous RTP sequence 2, but the GS stream index jumps to 5: a slot was consumed
+        // upstream, no RTP packet is missing.
+        let midFrameHole = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: 2, frameIndex: 7, flags: 0x01, media: [0xBB], streamSequence: 5),
+                                                         sequence: 2, handoff: handoff)
+        let events = receiver.process(datagram: midFrameHole)
+        #expect(NvstReceiverFixtures.frames(events).isEmpty)
+        #expect(NvstReceiverFixtures.recoveries(events) == 0)
+        let chainBreaks = events.filter {
+            if case .chainBroken = $0 {
+                true
+            } else {
+                false
+            }
+        }.count
+        #expect(chainBreaks == 1)
+        let stats = receiver.snapshot
+        #expect(stats.recoveries == 1)
+        #expect(stats.finalizedLossPackets == 0)
+    }
+
+    /// The live 5K/120 failure shape: multi-packet frames, one packet lost mid-frame. Only the
+    /// frame carrying the hole may be lost — the frames behind it ride on packets the old flush
+    /// destroyed wholesale.
+    @Test func oneLostPacketInsideAFrameCostsExactlyThatFrame() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 32)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let packetsPerFrame: UInt16 = 50
+        let droppedSequence: UInt16 = 75 // mid-frame 2
+        var emitted = 0
+        let sofBytes: [UInt8] = [0x00, 0x00, 0x00, 0x01, 0x65]
+        for frame in UInt16(1) ... UInt16(3) {
+            for position in UInt16(0) ..< packetsPerFrame {
+                let sequence = (frame - 1) * packetsPerFrame + position + 1
+                guard sequence != droppedSequence else { continue }
+                var flags: UInt8 = 0x01
+                if position == 0 {
+                    flags |= 0x04
+                }
+                if position == packetsPerFrame - 1 {
+                    flags |= 0x02
+                }
+                let media: [UInt8] = position == 0 ? sofBytes : [UInt8(truncatingIfNeeded: sequence)]
+                let datagram = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(frame), flags: flags, media: media),
+                                                             sequence: sequence, handoff: handoff)
+                emitted += NvstReceiverFixtures.frames(receiver.process(datagram: datagram)).count
+            }
+        }
+        let stats = receiver.snapshot
+        // Frame 2 has the hole; frames 1 and 3 must both survive.
+        #expect(emitted == 2)
+        #expect(stats.framesEmitted == 2)
+        #expect(stats.finalizedLossPackets == 1)
+        #expect(stats.recoveries == 1)
+        // The frame-2 remnants behind the hole are individually rejected by the reassembler as
+        // awaiting-start-of-frame; that is the expected local cost, not extra frame loss.
+        #expect(stats.abandonedFrames == 0)
+    }
+
+    /// Several isolated losses across a long stream each cost one frame and one loss count —
+    /// no compounding, no stuck reassembler, no double-counted recovery.
+    @Test func isolatedLossesAcrossAStreamDoNotCompound() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 32)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+        let packetsPerFrame: UInt16 = 30
+        let frameCount: UInt16 = 20
+        let dropped: Set<UInt16> = [100, 250, 400] // frames 4, 9, 14 — all far from the stream tail
+        var emitted = 0
+        for frame in UInt16(1) ... frameCount {
+            for position in UInt16(0) ..< packetsPerFrame {
+                let sequence = (frame - 1) * packetsPerFrame + position + 1
+                guard !dropped.contains(sequence) else { continue }
+                var flags: UInt8 = 0x01
+                if position == 0 {
+                    flags |= 0x04
+                }
+                if position == packetsPerFrame - 1 {
+                    flags |= 0x02
+                }
+                let media: [UInt8] = position == 0 ? [0x00, 0x00, 0x00, 0x01, 0x65] : [UInt8(truncatingIfNeeded: sequence)]
+                let datagram = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(frame), flags: flags, media: media),
+                                                             sequence: sequence, handoff: handoff)
+                emitted += NvstReceiverFixtures.frames(receiver.process(datagram: datagram)).count
+            }
+        }
+        let stats = receiver.snapshot
+        #expect(emitted == Int(frameCount) - dropped.count)
+        #expect(stats.finalizedLossPackets == UInt64(dropped.count))
+        #expect(stats.recoveries == UInt64(dropped.count))
+    }
+
+    /// End to end through SRTP, parse, FEC recovery, reorder and reassembly: a lost source packet
+    /// is rebuilt from the block's parity packet, the frame still emits, and no loss is recorded —
+    /// the seat never learns anything was lost.
+    @Test func aLostPacketIsRepairedFromParityAndTheFrameStillEmits() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+
+        func fecWord(index: UInt32) -> UInt32 {
+            (50 << 4) | (index << 12) | (2 << 22)
+        }
+        /// One frame per FEC block: two sources (SOF, EOF) and one parity shard (50% of 2).
+        func blockPackets(frameIndex: UInt32, baseSequence: UInt16, seed: UInt8) -> [(UInt16, Data)] {
+            let sof = NvstReceiverFixtures.packet(sequence: baseSequence, frameIndex: frameIndex, flags: 0x05,
+                                                  media: [0x00, 0x00, 0x00, 0x01, 0x65, seed], fecWord: fecWord(index: 0))
+            let eof = NvstReceiverFixtures.packet(sequence: baseSequence + 1, frameIndex: frameIndex, flags: 0x03,
+                                                  media: [0xBB, seed, 0xCC], fecWord: fecWord(index: 1))
+            let size = max(sof.count, eof.count)
+            let shards = [sof, eof].map { source -> [UInt8] in
+                let bytes = [UInt8](source)
+                return bytes.count == size ? bytes : bytes + [UInt8](repeating: 0, count: size - bytes.count)
+            }
+            let parity = NvstReedSolomon.encode(data: shards, parityCount: 1, size: size)!
+            let parityHeader = NvstReceiverFixtures.packet(sequence: baseSequence + 2, frameIndex: frameIndex, flags: 0x00,
+                                                           media: [], fecWord: fecWord(index: 2))
+            let parityPacket = parityHeader + Data(parity[0][NvstFecRecovery.headerLength...])
+            return [(baseSequence, sof), (baseSequence + 1, eof), (baseSequence + 2, parityPacket)]
+        }
+
+        // Clean blocks first: recovery arms only after verifying the scheme against this stream.
+        var emitted = 0
+        for round in 0 ..< NvstFecRecovery.verificationTarget {
+            for (sequence, plain) in blockPackets(frameIndex: UInt32(round + 1),
+                                                  baseSequence: UInt16(round * 3 + 1),
+                                                  seed: UInt8(round))
+            {
+                try emitted += NvstReceiverFixtures.frames(receiver.process(datagram: NvstReceiverFixtures.seal(plain, sequence: sequence, handoff: handoff))).count
+            }
+        }
+        #expect(emitted == NvstFecRecovery.verificationTarget)
+        #expect(receiver.fecFindings.isArmed)
+
+        // The lossy frame: its start-of-frame packet never arrives.
+        let base = UInt16(NvstFecRecovery.verificationTarget * 3 + 1)
+        let lossy = blockPackets(frameIndex: UInt32(NvstFecRecovery.verificationTarget + 1),
+                                 baseSequence: base, seed: 0x42)
+        #expect(try NvstReceiverFixtures.frames(receiver.process(datagram: NvstReceiverFixtures.seal(lossy[1].1, sequence: lossy[1].0, handoff: handoff))).isEmpty)
+        let events = try receiver.process(datagram: NvstReceiverFixtures.seal(lossy[2].1, sequence: lossy[2].0, handoff: handoff))
+        #expect(NvstReceiverFixtures.frames(events).count == 1)
+        #expect(NvstReceiverFixtures.frames(events).first?.isKeyframe == true)
+        #expect(NvstReceiverFixtures.recoveries(events) == 0)
+
+        let stats = receiver.snapshot
+        #expect(stats.finalizedLossPackets == 0)
+        #expect(stats.recoveries == 0)
+        #expect(receiver.fecFindings.recoveredPackets == 1)
+        #expect(stats.framesEmitted == UInt64(NvstFecRecovery.verificationTarget) + 1)
+    }
+
+    /// With FEC armed, a gap outlives the plain reorder window: the block's parity — the repair —
+    /// arrives after all of the block's sources, so finalizing at the plain window would lose the
+    /// race and turn a repairable hole into a lost frame plus a keyframe round trip.
+    @Test func anOpenGapWaitsForFecRepairBeforeBecomingLoss() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+
+        func fecWord(index: UInt32) -> UInt32 {
+            (50 << 4) | (index << 12) | (2 << 22)
+        }
+        func blockPackets(frameIndex: UInt32, baseSequence: UInt16, seed: UInt8) -> [(UInt16, Data)] {
+            let sof = NvstReceiverFixtures.packet(sequence: baseSequence, frameIndex: frameIndex, flags: 0x05,
+                                                  media: [0x00, 0x00, 0x00, 0x01, 0x65, seed], fecWord: fecWord(index: 0))
+            let eof = NvstReceiverFixtures.packet(sequence: baseSequence + 1, frameIndex: frameIndex, flags: 0x03,
+                                                  media: [0xBB, seed, 0xCC], fecWord: fecWord(index: 1))
+            let size = max(sof.count, eof.count)
+            let shards = [sof, eof].map { source -> [UInt8] in
+                let bytes = [UInt8](source)
+                return bytes.count == size ? bytes : bytes + [UInt8](repeating: 0, count: size - bytes.count)
+            }
+            let parity = NvstReedSolomon.encode(data: shards, parityCount: 1, size: size)!
+            let parityHeader = NvstReceiverFixtures.packet(sequence: baseSequence + 2, frameIndex: frameIndex, flags: 0x00,
+                                                           media: [], fecWord: fecWord(index: 2))
+            return [(baseSequence, sof), (baseSequence + 1, eof),
+                    (baseSequence + 2, parityHeader + Data(parity[0][NvstFecRecovery.headerLength...]))]
+        }
+        for round in 0 ..< NvstFecRecovery.verificationTarget {
+            for (sequence, plain) in blockPackets(frameIndex: UInt32(round + 1),
+                                                  baseSequence: UInt16(round * 3 + 1),
+                                                  seed: UInt8(round))
+            {
+                _ = try receiver.process(datagram: NvstReceiverFixtures.seal(plain, sequence: sequence, handoff: handoff))
+            }
+        }
+        #expect(receiver.fecFindings.isArmed)
+
+        // A jump well past the plain window (4) but inside the repair window: the gap must stay
+        // open — no recovery event, no finalized loss — while repair still has a chance.
+        let base = UInt16(NvstFecRecovery.verificationTarget * 3 + 1)
+        let far = try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: base + 20, frameIndex: 99, flags: 0x05,
+                                                                            media: [0x00, 0x00, 0x00, 0x01, 0x65]),
+                                                sequence: base + 20, handoff: handoff)
+        let events = receiver.process(datagram: far)
+        #expect(NvstReceiverFixtures.recoveries(events) == 0)
+        #expect(NvstReceiverFixtures.frames(events).isEmpty)
+        #expect(receiver.snapshot.finalizedLossPackets == 0)
+    }
+
+    /// A light scene sends few packets, so the repair window measured in packets could hold every
+    /// later frame for seconds. Once repair has had its time, the gap becomes loss.
+    /// A menu can run at ~120 packets/s, where 32 packets take a quarter of a second: the gap is
+    /// loss once it has waited out the time bound, however few packets arrived behind it.
+    @Test func aGapInALightStreamBecomesLossAfterTheTimeBoundNotThePacketWindow() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 32)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        func frame(_ sequence: UInt16) throws -> Data {
+            try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: sequence, frameIndex: UInt32(sequence), flags: 0x07,
+                                                                      media: [0x00, 0x00, 0x00, 0x01, 0x41, UInt8(sequence)]),
+                                          sequence: sequence, handoff: handoff)
+        }
+        _ = try receiver.process(datagram: frame(1))
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: frame(3))) == 0)
+        clock.withLock { $0 = NvstVideoReceiver.fecRepairMaximumWaitNanoseconds - 1 }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: frame(4))) == 0)
+        clock.withLock { $0 = NvstVideoReceiver.fecRepairMaximumWaitNanoseconds }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: frame(5))) == 1)
+        #expect(receiver.snapshot.finalizedLossPackets == 1)
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: frame(6))) == 0)
+    }
+
+    /// Losing only a block's repair packet loses nothing: the frame already completed, so the next
+    /// frame is delivered at once instead of waiting on the gap and then asking for a keyframe.
+    @Test func aLostParityPacketOfACompleteBlockIsSteppedOver() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { 0 })
+
+        func fecWord(index: UInt32) -> UInt32 {
+            (50 << 4) | (index << 12) | (2 << 22)
+        }
+        func blockPackets(frameIndex: UInt32, baseSequence: UInt16, seed: UInt8) -> [(UInt16, Data)] {
+            let sof = NvstReceiverFixtures.packet(sequence: baseSequence, frameIndex: frameIndex, flags: 0x05,
+                                                  media: [0x00, 0x00, 0x00, 0x01, 0x65, seed], fecWord: fecWord(index: 0))
+            let eof = NvstReceiverFixtures.packet(sequence: baseSequence + 1, frameIndex: frameIndex, flags: 0x03,
+                                                  media: [0xBB, seed, 0xCC], fecWord: fecWord(index: 1))
+            let size = max(sof.count, eof.count)
+            let shards = [sof, eof].map { source -> [UInt8] in
+                let bytes = [UInt8](source)
+                return bytes.count == size ? bytes : bytes + [UInt8](repeating: 0, count: size - bytes.count)
+            }
+            let parity = NvstReedSolomon.encode(data: shards, parityCount: 1, size: size)!
+            let parityHeader = NvstReceiverFixtures.packet(sequence: baseSequence + 2, frameIndex: frameIndex, flags: 0x00,
+                                                           media: [], fecWord: fecWord(index: 2))
+            return [(baseSequence, sof), (baseSequence + 1, eof),
+                    (baseSequence + 2, parityHeader + Data(parity[0][NvstFecRecovery.headerLength...]))]
+        }
+        var emitted = 0
+        var recoveries = 0
+        let frameCount = NvstFecRecovery.verificationTarget + 3
+        for round in 0 ..< frameCount {
+            let packets = blockPackets(frameIndex: UInt32(round + 1), baseSequence: UInt16(round * 3 + 1), seed: UInt8(round))
+            let lossy = round == NvstFecRecovery.verificationTarget
+            for (position, (sequence, plain)) in packets.enumerated() where !(lossy && position == 2) {
+                let events = try receiver.process(datagram: NvstReceiverFixtures.seal(plain, sequence: sequence, handoff: handoff))
+                emitted += NvstReceiverFixtures.frames(events).count
+                recoveries += NvstReceiverFixtures.recoveries(events)
+            }
+        }
+        #expect(receiver.fecFindings.isArmed)
+        #expect(emitted == frameCount)
+        #expect(recoveries == 0)
+        #expect(receiver.snapshot.finalizedLossPackets == 0)
+        #expect(receiver.snapshot.parityOnlyLossPackets == 1)
+    }
+}
+
+/// The armed FEC repair wait: how long an open gap is held for parity that is still in flight,
+/// and what happens when that parity arrives — or never does.
+@Suite(.serialized)
+struct NvstFecRepairWaitTests {
+    /// One FEC block as the seat sends it: `sourceCount` sources plus `percentage`% parity, every
+    /// shard zero-padded to the block's uniform size.
+    private func fecBlock(frameIndex: UInt32,
+                          baseSequence: UInt16,
+                          sourceCount: UInt32,
+                          percentage: UInt32,
+                          seed: UInt8) -> [(UInt16, Data)]
+    {
+        func fecWord(index: UInt32) -> UInt32 {
+            (percentage << 4) | (index << 12) | (sourceCount << 22)
+        }
+        let sources = (0 ..< Int(sourceCount)).map { index -> Data in
+            var flags: UInt8 = 0x01
+            if index == 0 {
+                flags |= 0x04
+            }
+            if index == Int(sourceCount) - 1 {
+                flags |= 0x02
+            }
+            let media: [UInt8] = index == 0
+                ? [0x00, 0x00, 0x00, 0x01, 0x65, seed]
+                : [0xBB, UInt8(truncatingIfNeeded: index), seed]
+            return NvstReceiverFixtures.packet(sequence: baseSequence + UInt16(index), frameIndex: frameIndex,
+                                               flags: flags, media: media, fecWord: fecWord(index: UInt32(index)))
+        }
+        let size = sources.map(\.count).max() ?? 0
+        let shards = sources.map { source -> [UInt8] in
+            let bytes = [UInt8](source)
+            return bytes.count == size ? bytes : bytes + [UInt8](repeating: 0, count: size - bytes.count)
+        }
+        let parityCount = (Int(sourceCount) * Int(percentage) + 99) / 100
+        guard let parity = NvstReedSolomon.encode(data: shards, parityCount: parityCount, size: size) else { return [] }
+        var packets = sources.enumerated().map { (baseSequence + UInt16($0.offset), $0.element) }
+        for (offset, shard) in parity.enumerated() {
+            let index = sourceCount + UInt32(offset)
+            let header = NvstReceiverFixtures.packet(sequence: baseSequence + UInt16(index), frameIndex: frameIndex,
+                                                     flags: 0x00, media: [], fecWord: fecWord(index: index))
+            packets.append((baseSequence + UInt16(index), header + Data(shard[NvstFecRecovery.headerLength...])))
+        }
+        return packets
+    }
+
+    /// Arms FEC the way the seat does: `verificationTarget` complete blocks whose re-encoded parity
+    /// matches byte for byte. Until then recovery is inert and the armed repair window never applies.
+    private func armFec(receiver: NvstVideoReceiver, handoff: NVSTVideoHandoff) throws {
+        for round in 0 ..< NvstFecRecovery.verificationTarget {
+            for (sequence, plain) in fecBlock(frameIndex: UInt32(round + 1), baseSequence: UInt16(round * 3 + 1),
+                                              sourceCount: 2, percentage: 50, seed: UInt8(round))
+            {
+                _ = try receiver.process(datagram: NvstReceiverFixtures.seal(plain, sequence: sequence, handoff: handoff))
+            }
+        }
+        #expect(receiver.fecFindings.isArmed)
+    }
+
+    /// With FEC armed the repair window governs, not the flat bound, so the gap is still held past
+    /// 100 ms — and the wall-clock ceiling still finalizes it, so a calm scene cannot freeze.
+    @Test func anOpenGapOutlivesTheFlatBoundWhileFecRepairMayStillArrive() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        try armFec(receiver: receiver, handoff: handoff)
+
+        let base = UInt16(NvstFecRecovery.verificationTarget * 3 + 1)
+        func farPacket(_ offset: UInt16) throws -> Data {
+            try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: base + offset, frameIndex: 99, flags: 0x05,
+                                                                      media: [0x00, 0x00, 0x00, 0x01, 0x65]),
+                                          sequence: base + offset, handoff: handoff)
+        }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: farPacket(20))) == 0)
+        clock.withLock { $0 = NvstVideoReceiver.fecRepairMaximumWaitNanoseconds }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: farPacket(21))) == 0)
+        clock.withLock { $0 = NvstVideoReceiver.fecRepairMaximumWaitCeilingNanoseconds - 1 }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: farPacket(22))) == 0)
+        clock.withLock { $0 = NvstVideoReceiver.fecRepairMaximumWaitCeilingNanoseconds }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: farPacket(23))) == 1)
+        #expect(receiver.snapshot.finalizedLossPackets == 20)
+    }
+
+    /// A block's parity trails an early-frame hole by most of the block, so at a rate where that
+    /// takes longer than the flat bound, the held gap is repaired instead of escalating.
+    @Test func aRepairableFecGapIsRepairedAfterTheFlatTimeBound() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        try armFec(receiver: receiver, handoff: handoff)
+
+        let base = UInt16(NvstFecRecovery.verificationTarget * 3 + 1)
+        let block = fecBlock(frameIndex: 500, baseSequence: base, sourceCount: 250, percentage: 2, seed: 9)
+        #expect(block.count == 255)
+        let perPacket = UInt64(1_000_000_000 / 1600)
+        var recoveries = 0
+        var frames = 0
+        // One source of the block is lost; the block's own parity is what has to put it back.
+        for (sequence, plain) in block where sequence != base + 1 {
+            clock.withLock { $0 &+= perPacket }
+            let events = try receiver.process(datagram: NvstReceiverFixtures.seal(plain, sequence: sequence, handoff: handoff))
+            recoveries += NvstReceiverFixtures.recoveries(events)
+            frames += NvstReceiverFixtures.frames(events).count
+        }
+        #expect(clock.withLock { $0 } > NvstVideoReceiver.fecRepairMaximumWaitNanoseconds)
+        #expect(recoveries == 0)
+        #expect(frames == 1)
+        #expect(receiver.fecFindings.recoveredPackets == 1)
+        #expect(receiver.snapshot.finalizedLossPackets == 0)
+    }
+
+    /// The repair window is measured in packets, so its wall-clock length depends on the rate: at
+    /// ~8,500 packets/s the 1,200-packet window is ~140 ms, and an armed gap waits it out.
+    @Test func theFecRepairWindowGovernsAtAHighPacketRate() throws {
+        let handoff = NvstReceiverFixtures.makeHandoff(reorderWindow: 4)
+        let clock = NvstManualClock()
+        let receiver = try NvstVideoReceiver(handoff: handoff, uptimeNanoseconds: { clock.withLock { $0 } })
+        try armFec(receiver: receiver, handoff: handoff)
+
+        let base = UInt16(NvstFecRecovery.verificationTarget * 3 + 1)
+        let perPacket = UInt64(1_000_000_000 / 8500)
+        func packet(_ offset: UInt16) throws -> Data {
+            try NvstReceiverFixtures.seal(NvstReceiverFixtures.packet(sequence: base + offset, frameIndex: 99, flags: 0x05,
+                                                                      media: [0x00, 0x00, 0x00, 0x01, 0x65]),
+                                          sequence: base + offset, handoff: handoff)
+        }
+        _ = try receiver.process(datagram: packet(0))
+        var recoveries = 0
+        // 1,199 packets behind the hole: ~141 ms, past the flat bound and inside the repair window.
+        for offset in UInt16(2) ... UInt16(NvstVideoReceiver.fecRepairReorderWindow) {
+            clock.withLock { $0 &+= perPacket }
+            try recoveries += NvstReceiverFixtures.recoveries(receiver.process(datagram: packet(offset)))
+        }
+        #expect(clock.withLock { $0 } > NvstVideoReceiver.fecRepairMaximumWaitNanoseconds)
+        #expect(recoveries == 0)
+        #expect(receiver.snapshot.finalizedLossPackets == 0)
+        clock.withLock { $0 &+= perPacket }
+        #expect(try NvstReceiverFixtures.recoveries(receiver.process(datagram: packet(UInt16(NvstVideoReceiver.fecRepairReorderWindow + 1)))) == 1)
+    }
+}
+
+struct NvstInboundCounterTests {
+    private func stun(messageType: UInt16) -> Data {
+        var packet = Data()
+        packet.append(UInt8(messageType >> 8))
+        packet.append(UInt8(messageType & 0xFF))
+        packet.append(contentsOf: [0x00, 0x00])
+        packet.append(contentsOf: [0x21, 0x12, 0xA4, 0x42]) // magic cookie
+        packet.append(Data(repeating: 0x11, count: 12))
+        return packet
+    }
+
+    @Test func datagramsAreCountedByClass() {
+        var counters = NvstInboundCounters()
+        counters.record(datagram: stun(messageType: 0x0001)) // Binding Request
+        counters.record(datagram: stun(messageType: 0x0101)) // Binding Success
+        counters.record(datagram: stun(messageType: 0x0111)) // Binding Error
+        counters.record(datagram: Data([0x16, 0xFE, 0xFD, 0x00, 0x00, 0x01])) // DTLS handshake
+        counters.record(datagram: Data([0x90, 0xE0, 0x00, 0x01, 0, 0, 0, 8, 0x11, 0x22, 0x33, 0x44])) // RTP
+        counters.record(datagram: Data([0x01, 0x02, 0x03]))
+        #expect(counters.stunRequests == 1)
+        #expect(counters.stunSuccessResponses == 1)
+        #expect(counters.stunErrorResponses == 1)
+        #expect(counters.dtls == 1)
+        #expect(counters.rtp == 1)
+        #expect(counters.other == 1)
+        #expect(counters.total == 6)
+        #expect(counters.summary.contains("stunOk=1"))
+        #expect(counters.summary.contains("rtp=1"))
+    }
+
+    @Test func anEmptySocketReportsNothingArrived() {
+        // The decisive reading on a silent stream: zero inbound, non-zero punches out.
+        var counters = NvstInboundCounters()
+        counters.punchesSent = 40
+        #expect(counters.total == 0)
+        #expect(counters.summary.hasPrefix("in=0 "))
+        #expect(counters.summary.contains("punchesOut=40"))
+    }
+}
+
+struct NvstBundleIceProbeTests {
+    @Test func transactionIdentifiersAreTwelveBytesAndVary() {
+        let first = NvstBundleIceProbe.transactionID()
+        let second = NvstBundleIceProbe.transactionID()
+        #expect(first.count == 12)
+        #expect(second.count == 12)
+        #expect(first != second)
+        #expect(NvstBundleIceProbe.iceBurstCount == 3)
+        #expect(NvstBundleIceProbe.nattUsername == "PING")
+    }
+}

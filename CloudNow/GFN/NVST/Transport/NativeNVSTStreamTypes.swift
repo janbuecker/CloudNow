@@ -73,7 +73,9 @@ nonisolated struct NativeNVSTTerminationReason: Equatable, Sendable {
         self.resultName = resultName
     }
 
-    var isPause: Bool { rawValue == Self.sessionPause }
+    var isPause: Bool {
+        rawValue == Self.sessionPause
+    }
 }
 
 nonisolated struct NativeNVSTSessionTermination: Equatable, Sendable {
@@ -84,7 +86,9 @@ nonisolated struct NativeNVSTSessionTermination: Equatable, Sendable {
     let message: String
 
     /// A paused session is not an ended session: the cloud session survives and can be resumed.
-    var isPause: Bool { reason.isPause }
+    var isPause: Bool {
+        reason.isPause
+    }
 }
 
 nonisolated extension NvstSeatTermination {
@@ -123,12 +127,6 @@ nonisolated struct NativeNVSTTransportFailure: Equatable, Sendable {
     let message: String
     let origin: Origin
     let recoveryClassification: RecoveryClassification
-
-    init(message: String, origin: Origin, recoveryClassification: RecoveryClassification) {
-        self.message = message
-        self.origin = origin
-        self.recoveryClassification = recoveryClassification
-    }
 }
 
 nonisolated enum NativeNVSTTransportTermination: Equatable, Sendable {
